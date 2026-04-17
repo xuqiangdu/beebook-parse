@@ -1,0 +1,55 @@
+# 环境变量（含敏感密钥，不上传）
+.env
+.env.local
+.env.*.local
+
+# 书籍原文件与解析结果（运行时数据）
+books/
+parsed_output/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+MANIFEST
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache
+coverage.xml
+*.cover
+
+# 日志
+*.log
+logs/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db

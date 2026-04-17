@@ -1,0 +1,65 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: beebook-redis
+    restart: unless-stopped
+    # ⭐v2: AOF 持久化必开,否则重启丢 meta/计数器
+    # maxmemory + LFU 驱逐:防 Redis 被解析结果撑爆
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lfu
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    container_name: beebook-app
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:5555:5555"
+    env_file:
+      - path: ./.env
+        required: false
+    environment:
+      - REDIS_HOST=redis
+      - AA_BASE_URL=https://zh.annas-archive.gl
+      - AA_SECRET_KEY=${AA_SECRET_KEY:-}
+      - OSS_BASE_URL=${OSS_BASE_URL:-}
+      # ⭐v2 并发配置(注释行为 4C8G 默认值,解开按需覆盖)
+      # - PARSE_SMALL_CONCURRENCY=16
+      # - PARSE_LARGE_CONCURRENCY=6
+      # - DOWNLOAD_CONCURRENCY=6
+      # - LARGE_FILE_THRESHOLD_MB=20
+      # - MAX_QUEUE_DEPTH=66
+      # - TASK_TIMEOUT_SEC=300
+      # - WATCHDOG_INTERVAL_SEC=30
+      # - MEM_HIGH_WATERMARK=0.85
+      # - MEM_CRITICAL_WATERMARK=0.95
+      # 缓存 TTL(秒): 省磁盘优先策略
+      #   - 原文件 1h 清理(占大头,及时释放磁盘)
+      #   - Redis 解析结果 3h 保持(文本小,提升命中率)
+      #   3h 内第二次请求:本地原文件可能已删,但 Redis 有解析结果,仍秒回
+      - REDIS_PARSE_TTL=10800      # 3h
+      - BOOK_CACHE_TTL_SEC=3600    # 1h
+    volumes:
+      - ./books:/app/books
+    depends_on:
+      redis:
+        condition: service_healthy
+    # ⭐v2 4C8G 资源限制(给 Redis 留 1G,系统留 ~1G)
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: "4"
+
+volumes:
+  redis-data:
