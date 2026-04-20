@@ -9,15 +9,21 @@ from __future__ import annotations
   }
 
 业务码约定(详见接入文档):
-  0   成功
-  400 参数错误
-  404 资源不存在
-  429 过载限流(v2)
-  500 内部错误
-  501 解析失败
-  502 所有上游镜像不可用 / 下载失败
-  503 解析结果文本为空
-  504 任务超时(v2,看门狗触发)
+  0     成功
+  400   参数错误
+  404   资源不存在
+  429   过载限流(v2)
+  500   内部错误
+  501   解析失败
+  502   所有上游镜像不可用 / 下载失败
+  503   解析结果文本为空
+  504   任务超时(v2,看门狗触发)
+  10001 AA 账号 VIP 过期或未开通
+  10002 AA 账号当日下载额度用尽
+
+号段规划:
+  3 位(HTTP 风格): 通用/传输层错误
+  1xxxx          : 业务扩展错误(会员、账号等)
 """
 
 import time
@@ -33,6 +39,10 @@ CODE_PARSE_FAILED = 501
 CODE_UPSTREAM_FAIL = 502
 CODE_EMPTY_CONTENT = 503
 CODE_TIMEOUT = 504            # v2: 看门狗超时
+
+# ---- 1xxxx 业务扩展(账号/会员) ----
+CODE_VIP_EXPIRED = 10001              # AA 账号 VIP 过期或未开通
+CODE_DOWNLOAD_QUOTA_EXCEEDED = 10002  # AA 账号当日下载额度用尽
 
 
 def _envelope(code: int, data, message: str) -> dict:

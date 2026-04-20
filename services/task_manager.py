@@ -49,7 +49,13 @@ from services.redis_store import (
     get_parse_meta,
     get_parse_text,
 )
-from services.book_storage import find_book_file, get_file_extension
+from services.book_storage import (
+    find_book_file,
+    get_file_extension,
+    AAVipExpiredError,
+    AADownloadQuotaExceededError,
+)
+from api.common import CODE_VIP_EXPIRED, CODE_DOWNLOAD_QUOTA_EXCEEDED
 import config
 
 logger = logging.getLogger(__name__)
@@ -303,7 +309,27 @@ def _do_download_and_parse(task_id: str, md5: str, extension: str,
         _incr_counter(r, "downloading")
         update_parse_status(r, task_id, "downloading")
 
-        filepath = find_book_file(md5, extension)
+        try:
+            filepath = find_book_file(md5, extension)
+        except AAVipExpiredError as e:
+            _decr_counter(r, "downloading")
+            store_parse_error(
+                r, task_id, str(e),
+                f"{md5}.{extension or '?'}", extension or "",
+                code=CODE_VIP_EXPIRED,
+            )
+            _release_task_lock(r, task_id)
+            return
+        except AADownloadQuotaExceededError as e:
+            _decr_counter(r, "downloading")
+            store_parse_error(
+                r, task_id, str(e),
+                f"{md5}.{extension or '?'}", extension or "",
+                code=CODE_DOWNLOAD_QUOTA_EXCEEDED,
+            )
+            _release_task_lock(r, task_id)
+            return
+
         if filepath is None:
             _decr_counter(r, "downloading")
             store_parse_error(

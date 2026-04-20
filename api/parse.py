@@ -27,6 +27,7 @@ from api.common import (
     CODE_PARAM_INVALID, CODE_NOT_FOUND,
     CODE_PARSE_FAILED, CODE_EMPTY_CONTENT,
     CODE_OVERLOADED, CODE_TIMEOUT, CODE_UPSTREAM_FAIL,
+    CODE_VIP_EXPIRED, CODE_DOWNLOAD_QUOTA_EXCEEDED,
 )
 
 parse_bp = Blueprint("parse", __name__)
@@ -146,6 +147,14 @@ def poll_parse_task(task_id):
             return api_err(CODE_UPSTREAM_FAIL,
                            meta.get("error", "上游/下载失败"),
                            http_status=502, data=payload)
+        if error_code == CODE_VIP_EXPIRED:
+            return api_err(CODE_VIP_EXPIRED,
+                           meta.get("error", "AA 账号 VIP 过期或未开通"),
+                           http_status=403, data=payload)
+        if error_code == CODE_DOWNLOAD_QUOTA_EXCEEDED:
+            return api_err(CODE_DOWNLOAD_QUOTA_EXCEEDED,
+                           meta.get("error", "AA 账号当日下载额度用尽"),
+                           http_status=429, data=payload)
         return api_err(CODE_PARSE_FAILED, meta.get("error", "解析失败"),
                        data=payload)
 

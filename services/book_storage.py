@@ -12,6 +12,7 @@ import os
 import json
 import logging
 import urllib.request
+import urllib.error
 
 import config
 
@@ -23,6 +24,14 @@ AA_SECRET_KEY = os.getenv("AA_SECRET_KEY", "")
 
 # OSS（备用）
 OSS_BASE_URL = os.getenv("OSS_BASE_URL", "")
+
+
+class AAVipExpiredError(Exception):
+    """AA 账号 VIP 过期或未开通，需上游报警并提示用户续费"""
+
+
+class AADownloadQuotaExceededError(Exception):
+    """AA 账号当日下载额度用尽，需上游报警并提示用户次日重试"""
 
 
 def find_book_file(md5: str, extension: str = "") -> str | None:
@@ -63,19 +72,42 @@ def _find_local(directory: str, md5: str) -> str | None:
 
 
 def _download_from_aa(books_dir: str, md5: str, extension: str) -> str | None:
-    """通过 Anna's Archive Fast Download API 下载"""
+    """通过 Anna's Archive Fast Download API 下载
+
+    Raises:
+        AAVipExpiredError:           AA 返回 403 "Not a member"
+        AADownloadQuotaExceededError: AA 返回 429 "No downloads left"
+    其它所有失败统一返回 None（调用方走通用"下载失败"分支）。
+    """
+    api_url = f"{AA_BASE_URL}/dyn/api/fast_download.json?md5={md5}&key={AA_SECRET_KEY}"
+    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        api_url = f"{AA_BASE_URL}/dyn/api/fast_download.json?md5={md5}&key={AA_SECRET_KEY}"
-        req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        # 只识别 AA 明确约定的两种业务错误，其余落通用分支
+        try:
+            err_body = json.loads(e.read() or b"{}")
+        except Exception:
+            err_body = {}
+        err_text = err_body.get("error", "")
+        if e.code == 403 and err_text == "Not a member":
+            raise AAVipExpiredError("AA 账号 VIP 过期或未开通") from e
+        if e.code == 429 and err_text == "No downloads left":
+            raise AADownloadQuotaExceededError("AA 账号当日下载额度用尽") from e
+        logger.warning(f"AA API HTTPError {e.code}: {err_text or e.reason}")
+        return None
+    except Exception as e:
+        logger.warning(f"AA API 请求失败: {md5} - {e}")
+        return None
 
-        download_url = data.get("download_url")
-        if not download_url:
-            logger.warning(f"AA API 无下载链接: {data.get('error', '?')}")
-            return None
+    download_url = data.get("download_url")
+    if not download_url:
+        logger.warning(f"AA API 无下载链接: {data.get('error', '?')}")
+        return None
 
-        # 下载文件
+    # 下载文件
+    try:
         ext = extension or "pdf"
         local_path = os.path.join(books_dir, f"{md5}.{ext}")
         req2 = urllib.request.Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -86,12 +118,11 @@ def _download_from_aa(books_dir: str, md5: str, extension: str) -> str | None:
                     if not chunk:
                         break
                     f.write(chunk)
-
         if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
             logger.info(f"AA 下载成功: {md5}.{ext} ({os.path.getsize(local_path)} bytes)")
             return local_path
     except Exception as e:
-        logger.warning(f"AA 下载失败: {md5} - {e}")
+        logger.warning(f"AA 文件下载失败: {md5} - {e}")
     return None
 
 
