@@ -348,22 +348,30 @@ def _parse_with_bs4(html: str) -> dict:
 def _parse_meta(text: str) -> dict:
     """
     解析元信息行，如:
-      "中文 [zh] · PDF · 36.0MB · 📘 非小说类图书 · 🚀/lgli/upload/zlib"
+      "英语 [en] · 繁体中文 [zh-Hant] · 中文 [zh] · EPUB · 0.5MB · 📘 非小说类图书 · 🚀/duxiu/lgli/zlib"
+
+    同一 md5 在 AA 上可能挂多个语言标签(来自不同数据源对这本书的语言标注),
+    全部保留到 languages / language_names;language / language_name 保留首项做向后兼容。
     """
     info = {
         "language": "",
         "language_name": "",
+        "languages": [],
+        "language_names": [],
         "extension": "",
         "filesize_str": "",
         "content_type_name": "",
         "sources": [],
     }
 
-    # 语言 "中文 [zh]" / "English [en]"
-    lang_match = re.search(r"(\S+)\s*\[(\w{2,3})\]", text)
-    if lang_match:
-        info["language_name"] = lang_match.group(1)
-        info["language"] = lang_match.group(2)
+    # 语言 "中文 [zh]" / "English [en]" / "繁体中文 [zh-Hant]"
+    # 放宽到 [\w-]{2,8} 以兼容 BCP-47 子标签 (zh-Hant / pt-BR / sr-Latn 等)
+    lang_matches = re.findall(r"(\S+)\s*\[([\w-]{2,8})\]", text)
+    if lang_matches:
+        info["language_names"] = [name for name, _ in lang_matches]
+        info["languages"] = [code for _, code in lang_matches]
+        info["language_name"] = lang_matches[0][0]
+        info["language"] = lang_matches[0][1]
 
     # 格式（大写或小写 .ext）
     for part in text.split("·"):
@@ -427,7 +435,8 @@ def _parse_with_regex(html: str) -> dict:
 
         ext_match = re.search(r"·\s*([A-Z]{2,5})\s*·", chunk)
         size_match = re.search(r"([\d.]+\s*[KMGT]B)", chunk)
-        lang_match = re.search(r"\[(\w{2,3})\]", chunk)
+        # 和 _parse_meta 保持一致:全部语言都抓,放宽到 BCP-47 子标签
+        lang_codes = re.findall(r"\[([\w-]{2,8})\]", chunk)
         cover_match = re.search(r'<img[^>]*\bsrc="([^"]+)"', chunk)
 
         results.append({
@@ -438,7 +447,8 @@ def _parse_with_regex(html: str) -> dict:
             "cover_url": cover_match.group(1) if cover_match else "",
             "extension": ext_match.group(1).lower() if ext_match else "",
             "filesize_str": size_match.group(1).replace(" ", "") if size_match else "",
-            "language": lang_match.group(1) if lang_match else "",
+            "language": lang_codes[0] if lang_codes else "",
+            "languages": lang_codes,
             "detail_url": f"{AA_BASE_URL}/md5/{md5}",
         })
 
