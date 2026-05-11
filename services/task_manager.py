@@ -282,12 +282,15 @@ def submit_parse_by_file(file_data: bytes, filename: str,
                         file_size=len(file_data))
     _incr_counter(r, "queued")
 
+    update_parse_status(r, task_id, "parsing", file_size=len(file_data))
+
     # 上传场景跳过下载阶段,直接路由到对应解析池
     # delete_after=True → 解析完(无论成败)立即删临时文件
     _route_to_parse_pool(
         len(file_data),
         _do_parse,
         task_id, upload_path, filename, ext, file_md5, len(file_data), engine, True,
+        from_queued=True,
     )
     return {"task_id": task_id, "status": "pending",
             "cached": False, "total_length": 0}
@@ -370,9 +373,11 @@ def _do_download_and_parse(task_id: str, md5: str, extension: str,
         _release_task_lock(r, task_id)
 
 
-def _route_to_parse_pool(file_size: int, fn, *args):
+def _route_to_parse_pool(file_size: int, fn, *args, from_queued: bool = False):
     """按文件大小路由到小池或大池"""
     r = get_redis()
+    if from_queued:
+        _decr_counter(r, "queued")
     _incr_counter(r, "parsing")
     if file_size > config.LARGE_FILE_THRESHOLD:
         _parse_large_executor.submit(_track_future, fn, *args)
