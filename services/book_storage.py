@@ -15,12 +15,18 @@ import urllib.request
 import urllib.error
 
 import config
+from services.aa_key_pool import (
+    available_keys,
+    mark_disabled,
+    mark_quota_exhausted,
+    seed_keys_from_env,
+    unavailable_status,
+)
 
 logger = logging.getLogger(__name__)
 
 # Anna's Archive 下载 API
 AA_BASE_URL = os.getenv("AA_BASE_URL", "https://zh.annas-archive.gl")
-AA_SECRET_KEY = os.getenv("AA_SECRET_KEY", "")
 
 # OSS（备用）
 OSS_BASE_URL = os.getenv("OSS_BASE_URL", "")
@@ -54,14 +60,24 @@ def find_book_file(md5: str, extension: str = "") -> tuple[str | None, str | Non
     reasons: list[str] = []
 
     # 2. 官方 Fast Download API
-    if AA_SECRET_KEY:
-        path, err = _download_from_aa(books_dir, md5, extension)
+    aa_keys = available_keys()
+    if not aa_keys:
+        seed_keys_from_env()
+        aa_keys = available_keys()
+
+    if aa_keys:
+        path, err = _download_from_aa_pool(books_dir, md5, extension, aa_keys)
         if path:
             return path, None
         if err:
             reasons.append(f"AA: {err}")
     else:
-        reasons.append("AA: 未配置 AA_SECRET_KEY")
+        status = unavailable_status()
+        if status == "quota":
+            raise AADownloadQuotaExceededError("AA 账号当日下载额度用尽")
+        if status == "disabled":
+            raise AAVipExpiredError("AA 账号 VIP 过期、未开通或 key 异常")
+        reasons.append("AA: 未配置可用 AA key")
 
     # 3. OSS
     if OSS_BASE_URL:
@@ -88,8 +104,46 @@ def _find_local(directory: str, md5: str) -> str | None:
     return None
 
 
-def _download_from_aa(books_dir: str, md5: str,
-                      extension: str) -> tuple[str | None, str | None]:
+def _download_from_aa_pool(books_dir: str, md5: str, extension: str,
+                           aa_keys: list[tuple[str, str]]) -> tuple[str | None, str | None]:
+    quota_errors = 0
+    disabled_errors = 0
+    reasons: list[str] = []
+
+    for kid, secret_key in aa_keys:
+        try:
+            path, err = _download_from_aa(books_dir, md5, extension, secret_key, kid)
+        except AADownloadQuotaExceededError as e:
+            quota_errors += 1
+            reason = str(e)
+            mark_quota_exhausted(secret_key, reason)
+            reasons.append(f"key={kid} quota")
+            continue
+        except AAVipExpiredError as e:
+            disabled_errors += 1
+            reason = str(e)
+            mark_disabled(secret_key, reason)
+            reasons.append(f"key={kid} disabled")
+            continue
+
+        if path:
+            return path, None
+        if err:
+            reasons.append(f"key={kid} {err}")
+
+    if quota_errors and quota_errors == len(aa_keys):
+        raise AADownloadQuotaExceededError("AA 账号当日下载额度用尽")
+    if disabled_errors and disabled_errors == len(aa_keys):
+        raise AAVipExpiredError("AA 账号 VIP 过期、未开通或 key 异常")
+    if quota_errors or disabled_errors:
+        reason = "; ".join(reasons) if reasons else "所有 AA key 均不可用"
+        raise AAVipExpiredError(f"AA 无可用 key: {reason}")
+
+    return None, "; ".join(reasons) if reasons else "无可用下载链接"
+
+
+def _download_from_aa(books_dir: str, md5: str, extension: str,
+                      secret_key: str, key_label: str = "") -> tuple[str | None, str | None]:
     """通过 Anna's Archive Fast Download API 下载
 
     Returns:
@@ -101,7 +155,7 @@ def _download_from_aa(books_dir: str, md5: str,
         AAVipExpiredError:           AA 返回 403 "Not a member"
         AADownloadQuotaExceededError: AA 返回 429 "No downloads left"
     """
-    api_url = f"{AA_BASE_URL}/dyn/api/fast_download.json?md5={md5}&key={AA_SECRET_KEY}"
+    api_url = f"{AA_BASE_URL}/dyn/api/fast_download.json?md5={md5}&key={secret_key}"
     req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -113,12 +167,14 @@ def _download_from_aa(books_dir: str, md5: str,
         except Exception:
             err_body = {}
         err_text = err_body.get("error", "")
-        if e.code == 403 and err_text == "Not a member":
-            raise AAVipExpiredError("AA 账号 VIP 过期或未开通") from e
+        if e.code in (401, 403):
+            if err_text == "Not a member":
+                raise AAVipExpiredError("AA 账号 VIP 过期或未开通") from e
+            raise AAVipExpiredError(f"AA key 异常或无权限: {err_text or e.reason}") from e
         if e.code == 429 and err_text == "No downloads left":
             raise AADownloadQuotaExceededError("AA 账号当日下载额度用尽") from e
         reason = f"API HTTP {e.code} {err_text or e.reason}"
-        logger.warning(f"AA API HTTPError {e.code}: {err_text or e.reason}")
+        logger.warning(f"AA API HTTPError {e.code}: key={key_label} {err_text or e.reason}")
         return None, reason
     except urllib.error.URLError as e:
         reason = f"API 网络错误: {e.reason}"

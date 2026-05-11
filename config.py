@@ -70,6 +70,9 @@ PARSE_LOCK_TTL = int(os.getenv("PARSE_LOCK_TTL", 600))
 # 若所有候选都不可用，则保留此默认值
 AA_BASE_URL = os.getenv("AA_BASE_URL", "https://zh.annas-archive.gl")
 AA_SECRET_KEY = os.getenv("AA_SECRET_KEY", "")
+AA_SECRET_KEYS = os.getenv("AA_SECRET_KEYS", "")
+AA_KEY_ADMIN_SECRET = os.getenv("AA_KEY_ADMIN_SECRET", "beebook")
+AA_KEY_COOLDOWN_SECONDS = int(os.getenv("AA_KEY_COOLDOWN_SECONDS", 24 * 3600))
 
 # 搜索镜像候选（逗号分隔）。启动时并行探测，用"能返回真实搜索结果页"作为活判据，
 # 选 latency 最低的作为 search_service 的实际 base URL。

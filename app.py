@@ -32,15 +32,18 @@ logging.basicConfig(
 
 from flask import Flask
 
+from api.aa_keys import aa_keys_bp
 from api.parse import parse_bp
 from api.search import search_bp
 from api.common import api_ok
+from services.aa_key_pool import list_keys, seed_keys_from_env
 from services.task_manager import reconcile_on_startup, start_watchdog
 import config
 
 app = Flask(__name__)
 # 让 jsonify 直接输出 UTF-8 中文字符,而非 \uXXXX 转义(方便终端 curl 查看)
 app.json.ensure_ascii = False
+app.register_blueprint(aa_keys_bp)
 app.register_blueprint(parse_bp)
 app.register_blueprint(search_bp)
 
@@ -50,6 +53,12 @@ app.register_blueprint(search_bp)
 # 看门狗只在主进程启动一次(线程级幂等)
 def _bootstrap():
     """启动时的一次性动作:清僵尸 + 起后台看门狗"""
+    try:
+        imported = seed_keys_from_env()
+        logging.getLogger(__name__).info("AA key 池初始化完成: 新增 %s 个 env key", imported)
+    except Exception:
+        logging.getLogger(__name__).exception("AA key 池初始化失败,下载仍会按 Redis 当前状态继续")
+
     try:
         stats = reconcile_on_startup()
         if not stats.get("skipped"):
@@ -81,12 +90,14 @@ def health():
 
     from parsers.factory import ParserFactory
     formats = ParserFactory().supported_formats()
+    aa_keys = list_keys()
 
     return api_ok({
         "status": "ok" if redis_ok else "degraded",
         "redis": "connected" if redis_ok else "disconnected",
         "search_source": config.AA_BASE_URL,
-        "download_api": "fast_download" if config.AA_SECRET_KEY else "未配置",
+        "download_api": "fast_download_pool" if aa_keys else "未配置",
+        "aa_key_count": len(aa_keys),
         "supported_formats": formats,
     })
 
