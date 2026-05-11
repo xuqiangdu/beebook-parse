@@ -34,8 +34,14 @@ class AADownloadQuotaExceededError(Exception):
     """AA 账号当日下载额度用尽，需上游报警并提示用户次日重试"""
 
 
-def find_book_file(md5: str, extension: str = "") -> str | None:
-    """根据 md5 查找/下载书籍文件"""
+def find_book_file(md5: str, extension: str = "") -> tuple[str | None, str | None]:
+    """根据 md5 查找/下载书籍文件
+
+    Returns:
+        (filepath, error_reason)
+          成功 → (filepath, None)
+          失败 → (None, 失败原因)  失败原因按来源汇总,供上层 errorMsg 透出
+    """
     md5 = md5.lower().strip()
     books_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "books")
     os.makedirs(books_dir, exist_ok=True)
@@ -43,22 +49,33 @@ def find_book_file(md5: str, extension: str = "") -> str | None:
     # 1. 本地缓存
     path = _find_local(books_dir, md5)
     if path:
-        return path
+        return path, None
+
+    reasons: list[str] = []
 
     # 2. 官方 Fast Download API
     if AA_SECRET_KEY:
-        path = _download_from_aa(books_dir, md5, extension)
+        path, err = _download_from_aa(books_dir, md5, extension)
         if path:
-            return path
+            return path, None
+        if err:
+            reasons.append(f"AA: {err}")
+    else:
+        reasons.append("AA: 未配置 AA_SECRET_KEY")
 
     # 3. OSS
     if OSS_BASE_URL:
-        path = _download_from_oss(books_dir, md5, extension)
+        path, err = _download_from_oss(books_dir, md5, extension)
         if path:
-            return path
+            return path, None
+        if err:
+            reasons.append(f"OSS: {err}")
+    else:
+        reasons.append("OSS: 未配置 OSS_BASE_URL")
 
-    logger.warning(f"找不到书籍文件: md5={md5} ext={extension}")
-    return None
+    reason = "; ".join(reasons) if reasons else "未知原因"
+    logger.warning(f"找不到书籍文件: md5={md5} ext={extension} | {reason}")
+    return None, reason
 
 
 def _find_local(directory: str, md5: str) -> str | None:
@@ -71,13 +88,18 @@ def _find_local(directory: str, md5: str) -> str | None:
     return None
 
 
-def _download_from_aa(books_dir: str, md5: str, extension: str) -> str | None:
+def _download_from_aa(books_dir: str, md5: str,
+                      extension: str) -> tuple[str | None, str | None]:
     """通过 Anna's Archive Fast Download API 下载
+
+    Returns:
+        (filepath, error_reason)
+          成功 → (filepath, None)
+          失败 → (None, 原因字符串)  —— 用于 errorMsg 透传到上游
 
     Raises:
         AAVipExpiredError:           AA 返回 403 "Not a member"
         AADownloadQuotaExceededError: AA 返回 429 "No downloads left"
-    其它所有失败统一返回 None（调用方走通用"下载失败"分支）。
     """
     api_url = f"{AA_BASE_URL}/dyn/api/fast_download.json?md5={md5}&key={AA_SECRET_KEY}"
     req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -95,21 +117,28 @@ def _download_from_aa(books_dir: str, md5: str, extension: str) -> str | None:
             raise AAVipExpiredError("AA 账号 VIP 过期或未开通") from e
         if e.code == 429 and err_text == "No downloads left":
             raise AADownloadQuotaExceededError("AA 账号当日下载额度用尽") from e
+        reason = f"API HTTP {e.code} {err_text or e.reason}"
         logger.warning(f"AA API HTTPError {e.code}: {err_text or e.reason}")
-        return None
-    except Exception as e:
+        return None, reason
+    except urllib.error.URLError as e:
+        reason = f"API 网络错误: {e.reason}"
         logger.warning(f"AA API 请求失败: {md5} - {e}")
-        return None
+        return None, reason
+    except Exception as e:
+        reason = f"API 异常: {type(e).__name__}: {e}"
+        logger.warning(f"AA API 请求失败: {md5} - {e}")
+        return None, reason
 
     download_url = data.get("download_url")
     if not download_url:
+        reason = f"API 未返回 download_url(上游: {data.get('error', '未知')})"
         logger.warning(f"AA API 无下载链接: {data.get('error', '?')}")
-        return None
+        return None, reason
 
     # 下载文件
+    ext = extension or "pdf"
+    local_path = os.path.join(books_dir, f"{md5}.{ext}")
     try:
-        ext = extension or "pdf"
-        local_path = os.path.join(books_dir, f"{md5}.{ext}")
         req2 = urllib.request.Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req2, timeout=300) as resp2:
             with open(local_path, "wb") as f:
@@ -120,15 +149,31 @@ def _download_from_aa(books_dir: str, md5: str, extension: str) -> str | None:
                     f.write(chunk)
         if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
             logger.info(f"AA 下载成功: {md5}.{ext} ({os.path.getsize(local_path)} bytes)")
-            return local_path
-    except Exception as e:
+            return local_path, None
+        return None, "下载完成但文件为空"
+    except urllib.error.HTTPError as e:
+        reason = f"下载 HTTP {e.code} {e.reason}"
         logger.warning(f"AA 文件下载失败: {md5} - {e}")
-    return None
+        return None, reason
+    except urllib.error.URLError as e:
+        reason = f"下载网络错误: {e.reason}"
+        logger.warning(f"AA 文件下载失败: {md5} - {e}")
+        return None, reason
+    except Exception as e:
+        reason = f"下载异常: {type(e).__name__}: {e}"
+        logger.warning(f"AA 文件下载失败: {md5} - {e}")
+        return None, reason
 
 
-def _download_from_oss(books_dir: str, md5: str, extension: str) -> str | None:
-    """从 OSS 下载"""
+def _download_from_oss(books_dir: str, md5: str,
+                       extension: str) -> tuple[str | None, str | None]:
+    """从 OSS 下载
+
+    Returns:
+        (filepath, error_reason)
+    """
     exts = [extension] if extension else ["pdf", "epub", "fb2", "djvu", "mobi", "txt"]
+    last_err = None
     for ext in exts:
         filename = f"{md5}.{ext}"
         url = f"{OSS_BASE_URL.rstrip('/')}/{filename}"
@@ -142,10 +187,17 @@ def _download_from_oss(books_dir: str, md5: str, extension: str) -> str | None:
                         with open(local_path, "wb") as f:
                             f.write(data)
                         logger.info(f"OSS 下载成功: {filename}")
-                        return local_path
-        except Exception:
-            pass
-    return None
+                        return local_path, None
+                    last_err = f"{filename} 返回空内容"
+                else:
+                    last_err = f"{filename} HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            last_err = f"{filename} HTTP {e.code}"
+        except urllib.error.URLError as e:
+            last_err = f"{filename} 网络错误: {e.reason}"
+        except Exception as e:
+            last_err = f"{filename} 异常: {type(e).__name__}: {e}"
+    return None, last_err or "无候选扩展名"
 
 
 def get_file_extension(filepath: str) -> str:

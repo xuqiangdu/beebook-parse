@@ -313,7 +313,7 @@ def _do_download_and_parse(task_id: str, md5: str, extension: str,
         update_parse_status(r, task_id, "downloading")
 
         try:
-            filepath = find_book_file(md5, extension)
+            filepath, dl_error = find_book_file(md5, extension)
         except AAVipExpiredError as e:
             _decr_counter(r, "downloading")
             store_parse_error(
@@ -335,9 +335,11 @@ def _do_download_and_parse(task_id: str, md5: str, extension: str,
 
         if filepath is None:
             _decr_counter(r, "downloading")
+            # ⭐ errorMsg 透出:把 find_book_file 收集到的真实失败原因带给上游
+            reason_suffix = f"(原因: {dl_error})" if dl_error else ""
             store_parse_error(
                 r, task_id,
-                f"找不到文件: md5={md5},请确认文件已导入存储或 AA_SECRET_KEY 已配置",
+                f"下载失败: md5={md5}{reason_suffix}",
                 f"{md5}.{extension or '?'}",
                 extension or "",
                 code=502,  # 下载/上游问题
