@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# 本地 docker compose 覆盖（让本地仍能 build，不影响生产 image 模式）
+docker-compose.override.yml
+
 # 书籍原文件与解析结果（运行时数据）
 books/
 parsed_output/

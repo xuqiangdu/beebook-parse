@@ -73,6 +73,9 @@ AA_SECRET_KEY = os.getenv("AA_SECRET_KEY", "")
 AA_SECRET_KEYS = os.getenv("AA_SECRET_KEYS", "")
 AA_KEY_ADMIN_SECRET = os.getenv("AA_KEY_ADMIN_SECRET", "beebook")
 AA_KEY_COOLDOWN_SECONDS = int(os.getenv("AA_KEY_COOLDOWN_SECONDS", 24 * 3600))
+# /api/admin/aa-keys/expiry-check：已缓存的会员到期时间距今 < 这个天数时，
+# 才二次登录三方账户页刷新（人工续费后能无感刷新到新到期时间）；否则直接用缓存
+AA_KEY_EXPIRY_REFRESH_DAYS = int(os.getenv("AA_KEY_EXPIRY_REFRESH_DAYS", 2))
 
 # 搜索镜像候选（逗号分隔）。启动时并行探测，用"能返回真实搜索结果页"作为活判据，
 # 选 latency 最低的作为 search_service 的实际 base URL。
