@@ -3,7 +3,7 @@ from __future__ import annotations
 from flask import Blueprint, request
 
 from api.common import api_err, api_ok, CODE_PARAM_INVALID
-from services.aa_key_pool import add_key, list_keys, check_expiry
+from services.aa_key_pool import check_expiry, list_keys, pool_health
 import config
 
 aa_keys_bp = Blueprint("aa_keys", __name__)
@@ -14,24 +14,26 @@ def _json_body() -> dict:
 
 
 def _check_secret(data: dict):
-    if data.get("secret") != config.AA_KEY_ADMIN_SECRET:
+    if not config.AA_KEY_ADMIN_SECRET:
+        return api_err(
+            CODE_PARAM_INVALID,
+            "AA key health admin secret is not configured",
+            http_status=503,
+        )
+    provided = request.headers.get("X-Admin-Secret") or data.get("secret")
+    if provided != config.AA_KEY_ADMIN_SECRET:
         return api_err(CODE_PARAM_INVALID, "secret 无效", http_status=403)
     return None
 
 
-@aa_keys_bp.route("/api/admin/aa-keys/add", methods=["POST"])
-def add_aa_key():
-    data = _json_body()
+@aa_keys_bp.route("/api/admin/aa-keys/health", methods=["GET"])
+def aa_key_health():
+    """Read-only redacted Anna account-pool health."""
+    data = {}
     err = _check_secret(data)
     if err:
         return err
-
-    secret_key = str(data.get("key", "")).strip()
-    if not secret_key:
-        return api_err(CODE_PARAM_INVALID, "请提供 key", http_status=400)
-
-    inserted = add_key(secret_key, source="api")
-    return api_ok({"inserted": inserted, "keys": list_keys()})
+    return api_ok(pool_health(include_accounts=True))
 
 
 @aa_keys_bp.route("/api/admin/aa-keys/list", methods=["POST"])

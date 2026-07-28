@@ -6,6 +6,14 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 
+# Redis for non-evictable Anna account-pool control state.
+# It must be explicitly configured so production cannot silently fall back to
+# an evictable result-cache Redis.
+CONTROL_REDIS_HOST = os.getenv("CONTROL_REDIS_HOST", "").strip()
+CONTROL_REDIS_PORT = int(os.getenv("CONTROL_REDIS_PORT", REDIS_PORT))
+CONTROL_REDIS_DB = int(os.getenv("CONTROL_REDIS_DB", 0))
+CONTROL_REDIS_PASSWORD = os.getenv("CONTROL_REDIS_PASSWORD", REDIS_PASSWORD)
+
 # Redis 大 Key 拆分阈值（512KB）
 REDIS_CHUNK_SIZE = int(os.getenv("REDIS_CHUNK_SIZE", 512 * 1024))
 # 解析结果缓存过期时间（秒）- 默认 3 小时
@@ -29,6 +37,20 @@ PARSE_LARGE_CONCURRENCY = int(os.getenv("PARSE_LARGE_CONCURRENCY", 6))
 
 # 下载并发池(独立于解析,避免下载慢拖累解析)
 DOWNLOAD_CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", 6))
+
+# Hard Anna fast-download limit; an environment override cannot exceed two.
+AA_DOWNLOAD_CONCURRENCY = min(
+    max(int(os.getenv("AA_DOWNLOAD_CONCURRENCY", 2)), 1),
+    2,
+)
+AA_DOWNLOAD_LEASE_SECONDS = max(
+    int(os.getenv("AA_DOWNLOAD_LEASE_SECONDS", 600)),
+    int(os.getenv("TASK_TIMEOUT_SEC", 300)) + 360,
+)
+AA_DOWNLOAD_SLOT_WAIT_SECONDS = min(
+    max(int(os.getenv("AA_DOWNLOAD_SLOT_WAIT_SECONDS", 30)), 1),
+    max(int(os.getenv("TASK_TIMEOUT_SEC", 300)) - 5, 1),
+)
 
 # 大小文件分界(MB)
 LARGE_FILE_THRESHOLD_MB = int(os.getenv("LARGE_FILE_THRESHOLD_MB", 20))
@@ -71,8 +93,14 @@ PARSE_LOCK_TTL = int(os.getenv("PARSE_LOCK_TTL", 600))
 AA_BASE_URL = os.getenv("AA_BASE_URL", "https://zh.annas-archive.gl")
 AA_SECRET_KEY = os.getenv("AA_SECRET_KEY", "")
 AA_SECRET_KEYS = os.getenv("AA_SECRET_KEYS", "")
-AA_KEY_ADMIN_SECRET = os.getenv("AA_KEY_ADMIN_SECRET", "beebook")
-AA_KEY_COOLDOWN_SECONDS = int(os.getenv("AA_KEY_COOLDOWN_SECONDS", 24 * 3600))
+AA_KEY_ADMIN_SECRET = os.getenv("AA_KEY_ADMIN_SECRET", "")
+AA_KEY_COOLDOWN_SECONDS = int(os.getenv("AA_KEY_COOLDOWN_SECONDS", 30 * 60))
+AA_KEY_DISABLED_PROBE_SECONDS = int(
+    os.getenv("AA_KEY_DISABLED_PROBE_SECONDS", 30 * 60)
+)
+AA_KEY_PROBE_LEASE_SECONDS = int(
+    os.getenv("AA_KEY_PROBE_LEASE_SECONDS", 5 * 60)
+)
 # /api/admin/aa-keys/expiry-check：已缓存的会员到期时间距今 < 这个天数时，
 # 才二次登录三方账户页刷新（人工续费后能无感刷新到新到期时间）；否则直接用缓存
 AA_KEY_EXPIRY_REFRESH_DAYS = int(os.getenv("AA_KEY_EXPIRY_REFRESH_DAYS", 2))

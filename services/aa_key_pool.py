@@ -3,38 +3,88 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import date, datetime
 
 import requests
 
-from services.redis_store import get_redis
 import config
+from services.redis_store import get_control_redis, get_redis
 
 logger = logging.getLogger(__name__)
 
-KEY_SET = "aa:keys"
-KEY_ADDED_AT = "aa:key:added_at"
-KEY_EXPIRY = "aa:key:expiry"          # hash: kid -> 会员到期时间戳(unix 秒，到期日 00:00)
-COOLDOWN_PREFIX = "aa:key:cooldown:"
-DISABLED_PREFIX = "aa:key:disabled:"
+# Only redacted identifiers and control metadata are stored in Redis.
+KEY_IDS = "aa:control:key_ids"
+KEY_STATE_PREFIX = "aa:control:key:"
+KEY_EXPIRY = "aa:control:key_expiry"
+ROTATION_KEY = "aa:control:rotation"
+PROBE_LEASE_PREFIX = "aa:control:probe:"
+DOWNLOAD_LEASES = "aa:control:download_leases"
+CONTENT_LEASE_PREFIX = "aa:control:content:"
 
-# AA 账户页会员到期行：会员：<strong>xxx</strong>，2026年5月15日 到期
+# Removed on startup because the legacy implementation stored raw keys here.
+LEGACY_RAW_KEY_SET = "aa:keys"
+
+_secrets_lock = threading.Lock()
+_secret_by_id: dict[str, str] = {}
+_local_download_slots = threading.BoundedSemaphore(config.AA_DOWNLOAD_CONCURRENCY)
+
 _EXPIRY_RE = re.compile(
     r"会员[：:].*?(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*到期"
 )
+
+_ACQUIRE_DOWNLOAD_SLOT = """
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then
+  return 0
+end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+return 1
+"""
+
+_RENEW_DOWNLOAD_SLOT = """
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+  return 1
+end
+return 0
+"""
+
+_RENEW_STRING_LEASE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+  return 1
+end
+return 0
+"""
+
+_RELEASE_STRING_LEASE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+class AnnaDownloadBusyError(Exception):
+    """Anna download slots did not become available before the wait deadline."""
 
 
 def key_id(secret_key: str) -> str:
     return hashlib.sha256(secret_key.encode("utf-8")).hexdigest()[:12]
 
 
-def _cooldown_key(kid: str) -> str:
-    return f"{COOLDOWN_PREFIX}{kid}"
+def _state_key(kid: str) -> str:
+    return f"{KEY_STATE_PREFIX}{kid}"
 
 
-def _disabled_key(kid: str) -> str:
-    return f"{DISABLED_PREFIX}{kid}"
+def _probe_lease_key(kid: str) -> str:
+    return f"{PROBE_LEASE_PREFIX}{kid}"
 
 
 def _env_keys() -> list[str]:
@@ -48,66 +98,417 @@ def _env_keys() -> list[str]:
     return list(dict.fromkeys(keys))
 
 
+def _configured_secrets() -> dict[str, str]:
+    with _secrets_lock:
+        return dict(_secret_by_id)
+
+
+def _safe_reason(reason: str) -> str:
+    value = str(reason or "")
+    for secret_key in _configured_secrets().values():
+        if secret_key:
+            value = value.replace(secret_key, "[redacted]")
+    return value[:500]
+
+
 def seed_keys_from_env() -> int:
-    """Import Docker/env configured keys into Redis on startup."""
-    added = 0
-    for secret_key in _env_keys():
-        if add_key(secret_key, source="env"):
-            added += 1
+    """Load Anna keys into process memory and persist only redacted IDs."""
+    secrets = {key_id(secret_key): secret_key for secret_key in _env_keys()}
+    with _secrets_lock:
+        _secret_by_id.clear()
+        _secret_by_id.update(secrets)
+
+    r = get_control_redis()
+    previous = set(r.smembers(KEY_IDS))
+    # Purge the legacy raw-key set from both the old result Redis and the
+    # control Redis without ever reading or logging its values.
+    try:
+        get_redis().delete(LEGACY_RAW_KEY_SET)
+    except Exception:
+        logger.warning("Failed to purge legacy AA key storage")
+    pipe = r.pipeline()
+    pipe.delete(LEGACY_RAW_KEY_SET)
+    pipe.delete(KEY_IDS)
+    if secrets:
+        pipe.sadd(KEY_IDS, *sorted(secrets))
+    now = int(time.time())
+    for kid in secrets:
+        state_key = _state_key(kid)
+        pipe.hsetnx(state_key, "status", "active")
+        pipe.hsetnx(state_key, "added_at", now)
+        pipe.hsetnx(state_key, "last_success_at", 0)
+        pipe.hsetnx(state_key, "last_error_at", 0)
+        pipe.hsetnx(state_key, "last_error", "")
+        pipe.hsetnx(state_key, "next_probe_at", 0)
+    pipe.execute()
+    added = len(set(secrets) - previous)
+    logger.info("AA account pool loaded from environment: accounts=%s new=%s",
+                len(secrets), added)
     return added
 
 
-def add_key(secret_key: str, source: str = "api") -> bool:
-    secret_key = secret_key.strip()
-    if not secret_key:
-        return False
+def _ensure_loaded() -> dict[str, str]:
+    secrets = _configured_secrets()
+    if secrets or not _env_keys():
+        return secrets
+    seed_keys_from_env()
+    return _configured_secrets()
 
-    r = get_redis()
-    inserted = bool(r.sadd(KEY_SET, secret_key))
-    kid = key_id(secret_key)
-    if inserted:
-        r.hset(KEY_ADDED_AT, kid, str(int(time.time())))
-        logger.info("AA key added: id=%s source=%s", kid, source)
-    if inserted or source == "api":
-        r.delete(_cooldown_key(kid), _disabled_key(kid))
-    return inserted
+
+def _to_int(value, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _state_for(r, kid: str) -> dict:
+    state = r.hgetall(_state_key(kid))
+    if not state:
+        state = {"status": "active"}
+    return state
 
 
 def list_keys() -> list[dict]:
-    r = get_redis()
-    keys = sorted(r.smembers(KEY_SET), key=lambda item: key_id(item))
-    added_at = r.hgetall(KEY_ADDED_AT)
+    """Return redacted account state. Raw keys never leave process memory."""
+    secrets = _ensure_loaded()
+    r = get_control_redis()
+    now = int(time.time())
     expiry_map = r.hgetall(KEY_EXPIRY)
     items: list[dict] = []
-    for secret_key in keys:
-        kid = key_id(secret_key)
-        disabled_reason = r.get(_disabled_key(kid))
-        cooldown_reason = r.get(_cooldown_key(kid))
-        cooldown_ttl = r.ttl(_cooldown_key(kid))
-        status = "active"
-        reason = None
-        if disabled_reason:
-            status = "disabled"
-            reason = disabled_reason
-        elif cooldown_reason:
-            status = "cooldown"
-            reason = cooldown_reason
+    for kid in sorted(secrets):
+        state = _state_for(r, kid)
+        status = state.get("status") or "active"
+        next_probe_at = _to_int(state.get("next_probe_at"))
         expiry = _to_ts(expiry_map.get(kid))
         items.append({
             "id": kid,
             "status": status,
-            "reason": reason,
-            "cooldown_ttl": cooldown_ttl if cooldown_ttl and cooldown_ttl > 0 else 0,
-            "added_at": int(added_at.get(kid, "0") or 0),
-            # 会员到期时间戳(unix 秒;缓存值,不主动登录三方,实时刷新走 check_expiry)
+            "last_success_at": _to_int(state.get("last_success_at")),
+            "last_error_at": _to_int(state.get("last_error_at")),
+            "last_error": state.get("last_error") or None,
+            "next_probe_at": next_probe_at,
+            "retry_after_seconds": max(next_probe_at - now, 0),
+            "probe_due": status != "active" and next_probe_at > 0
+                         and next_probe_at <= now,
+            "added_at": _to_int(state.get("added_at")),
             "expiry": expiry,
             "days_left": _days_until(expiry),
         })
     return items
 
 
+def pool_health(include_accounts: bool = True) -> dict:
+    items = list_keys()
+    summary = {
+        "configured": len(items),
+        "active": sum(item["status"] == "active" for item in items),
+        "cooldown": sum(item["status"] == "cooldown" for item in items),
+        "disabled": sum(item["status"] == "disabled" for item in items),
+        "download_concurrency_limit": config.AA_DOWNLOAD_CONCURRENCY,
+    }
+    probes = [
+        item["next_probe_at"] for item in items
+        if item["next_probe_at"] > 0
+    ]
+    summary["next_probe_at"] = min(probes) if probes else 0
+    if include_accounts:
+        summary["accounts"] = items
+    return summary
+
+
+def _rotated_ids(r, ids: list[str]) -> list[str]:
+    if not ids:
+        return []
+    cursor = int(r.incr(ROTATION_KEY)) - 1
+    start = cursor % len(ids)
+    return ids[start:] + ids[:start]
+
+
+def available_keys() -> list[tuple[str, str]]:
+    """Return usable accounts in an atomically rotated order.
+
+    Cooldown/disabled accounts are selected only when their next probe is due,
+    and a Redis probe lease prevents concurrent probe storms.
+    """
+    secrets = _ensure_loaded()
+    if not secrets:
+        return []
+
+    r = get_control_redis()
+    now = int(time.time())
+    result: list[tuple[str, str]] = []
+    for kid in _rotated_ids(r, sorted(secrets)):
+        state = _state_for(r, kid)
+        status = state.get("status") or "active"
+        if status == "active":
+            result.append((kid, secrets[kid]))
+            continue
+
+        next_probe_at = _to_int(state.get("next_probe_at"))
+        if next_probe_at <= 0 or next_probe_at > now:
+            continue
+        probe_token = uuid.uuid4().hex
+        if r.set(
+            _probe_lease_key(kid),
+            probe_token,
+            nx=True,
+            ex=max(config.AA_KEY_PROBE_LEASE_SECONDS, 1),
+        ):
+            result.append((kid, secrets[kid]))
+    return result
+
+
+def unavailable_info() -> dict:
+    """Describe the current pool-level business state without secrets."""
+    items = list_keys()
+    if not items:
+        return {
+            "reason": "unconfigured",
+            "next_probe_at": 0,
+            "retry_after_seconds": 0,
+        }
+    if any(item["status"] == "active" for item in items):
+        return {
+            "reason": "available",
+            "next_probe_at": 0,
+            "retry_after_seconds": 0,
+        }
+
+    cooldown = [item for item in items if item["status"] == "cooldown"]
+    reason = "quota" if cooldown else "disabled"
+    candidates = [
+        item["next_probe_at"] for item in items
+        if item["next_probe_at"] > 0
+    ]
+    next_probe_at = min(candidates) if candidates else 0
+    return {
+        "reason": reason,
+        "next_probe_at": next_probe_at,
+        "retry_after_seconds": max(next_probe_at - int(time.time()), 0),
+    }
+
+
+def unavailable_status() -> str | None:
+    info = unavailable_info()
+    if info["reason"] in {"available", "unconfigured"}:
+        return None
+    return info["reason"]
+
+
+def mark_success(secret_key: str) -> None:
+    kid = key_id(secret_key)
+    now = int(time.time())
+    r = get_control_redis()
+    r.hset(_state_key(kid), mapping={
+        "status": "active",
+        "last_success_at": now,
+        "next_probe_at": 0,
+    })
+    r.delete(_probe_lease_key(kid))
+
+
+def mark_transient_error(secret_key: str, reason: str) -> None:
+    kid = key_id(secret_key)
+    get_control_redis().hset(_state_key(kid), mapping={
+        "last_error_at": int(time.time()),
+        "last_error": _safe_reason(reason),
+    })
+
+
+def mark_quota_exhausted(secret_key: str, reason: str) -> None:
+    kid = key_id(secret_key)
+    now = int(time.time())
+    next_probe_at = now + max(config.AA_KEY_COOLDOWN_SECONDS, 60)
+    r = get_control_redis()
+    r.hset(_state_key(kid), mapping={
+        "status": "cooldown",
+        "quota_exhausted_at": now,
+        "last_error_at": now,
+        "last_error": _safe_reason(reason),
+        "next_probe_at": next_probe_at,
+    })
+    r.delete(_probe_lease_key(kid))
+    logger.warning("AA account quota exhausted: id=%s next_probe_at=%s",
+                   kid, next_probe_at)
+
+
+def mark_disabled(secret_key: str, reason: str) -> None:
+    kid = key_id(secret_key)
+    now = int(time.time())
+    next_probe_at = now + max(config.AA_KEY_DISABLED_PROBE_SECONDS, 60)
+    r = get_control_redis()
+    r.hset(_state_key(kid), mapping={
+        "status": "disabled",
+        "disabled_at": now,
+        "last_error_at": now,
+        "last_error": _safe_reason(reason),
+        "next_probe_at": next_probe_at,
+    })
+    r.delete(_probe_lease_key(kid))
+    logger.error("AA account disabled: id=%s next_probe_at=%s",
+                 kid, next_probe_at)
+
+
+@contextmanager
+def anna_download_slot():
+    """Enforce the Anna fast-download concurrency limit locally and in Redis."""
+    local_acquired = _local_download_slots.acquire(
+        timeout=config.AA_DOWNLOAD_SLOT_WAIT_SECONDS
+    )
+    if not local_acquired:
+        raise AnnaDownloadBusyError("Anna download slots are busy")
+
+    token = uuid.uuid4().hex
+    control = None
+    distributed_acquired = False
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = None
+    deadline = time.monotonic() + config.AA_DOWNLOAD_SLOT_WAIT_SECONDS
+    try:
+        while time.monotonic() < deadline:
+            now_ms = int(time.time() * 1000)
+            lease_until_ms = now_ms + config.AA_DOWNLOAD_LEASE_SECONDS * 1000
+            try:
+                control = get_control_redis()
+                distributed_acquired = bool(control.eval(
+                    _ACQUIRE_DOWNLOAD_SLOT,
+                    1,
+                    DOWNLOAD_LEASES,
+                    now_ms,
+                    config.AA_DOWNLOAD_CONCURRENCY,
+                    lease_until_ms,
+                    token,
+                    config.AA_DOWNLOAD_LEASE_SECONDS,
+                ))
+            except Exception as exc:
+                raise AnnaDownloadBusyError(
+                    "Anna download control plane is unavailable"
+                ) from exc
+            if distributed_acquired:
+                break
+            time.sleep(0.05)
+
+        if not distributed_acquired:
+            raise AnnaDownloadBusyError("Anna download slots are busy")
+        heartbeat_thread = threading.Thread(
+            target=_renew_download_slot,
+            args=(control, token, heartbeat_stop),
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        yield
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1)
+        if distributed_acquired and control is not None:
+            try:
+                control.zrem(DOWNLOAD_LEASES, token)
+            except Exception:
+                logger.warning("Failed to release Anna download lease")
+        _local_download_slots.release()
+
+
+def _renew_download_slot(control, token: str,
+                         stop: threading.Event) -> None:
+    interval = max(min(config.AA_DOWNLOAD_LEASE_SECONDS // 3, 30), 1)
+    while not stop.wait(interval):
+        try:
+            now_ms = int(time.time() * 1000)
+            renewed = control.eval(
+                _RENEW_DOWNLOAD_SLOT,
+                1,
+                DOWNLOAD_LEASES,
+                token,
+                now_ms + config.AA_DOWNLOAD_LEASE_SECONDS * 1000,
+                config.AA_DOWNLOAD_LEASE_SECONDS,
+            )
+            if not renewed:
+                logger.error("AA download lease disappeared before release")
+                return
+        except Exception as exc:
+            logger.error(
+                "AA download lease renewal failed: %s",
+                type(exc).__name__,
+            )
+
+
+@contextmanager
+def anna_content_lock(md5: str):
+    """Serialize publication of one cached source file across all workers."""
+    token = uuid.uuid4().hex
+    lease_key = f"{CONTENT_LEASE_PREFIX}{md5.lower().strip()}"
+    deadline = time.monotonic() + config.AA_DOWNLOAD_SLOT_WAIT_SECONDS
+    control = None
+    acquired = False
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = None
+    try:
+        while time.monotonic() < deadline:
+            try:
+                control = get_control_redis()
+                acquired = bool(control.set(
+                    lease_key,
+                    token,
+                    nx=True,
+                    ex=config.AA_DOWNLOAD_LEASE_SECONDS,
+                ))
+            except Exception as exc:
+                raise AnnaDownloadBusyError(
+                    "Anna content lock control plane is unavailable"
+                ) from exc
+            if acquired:
+                break
+            time.sleep(0.05)
+        if not acquired:
+            raise AnnaDownloadBusyError("Anna content is already downloading")
+        heartbeat_thread = threading.Thread(
+            target=_renew_string_lease,
+            args=(control, lease_key, token, heartbeat_stop),
+            daemon=True,
+        )
+        heartbeat_thread.start()
+        yield
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=1)
+        if acquired and control is not None:
+            try:
+                control.eval(
+                    _RELEASE_STRING_LEASE,
+                    1,
+                    lease_key,
+                    token,
+                )
+            except Exception:
+                logger.warning("Failed to release Anna content lease")
+
+
+def _renew_string_lease(control, lease_key: str, token: str,
+                        stop: threading.Event) -> None:
+    interval = max(min(config.AA_DOWNLOAD_LEASE_SECONDS // 3, 30), 1)
+    while not stop.wait(interval):
+        try:
+            renewed = control.eval(
+                _RENEW_STRING_LEASE,
+                1,
+                lease_key,
+                token,
+                config.AA_DOWNLOAD_LEASE_SECONDS,
+            )
+            if not renewed:
+                logger.error("AA content lease disappeared before release")
+                return
+        except Exception as exc:
+            logger.error(
+                "AA content lease renewal failed: %s",
+                type(exc).__name__,
+            )
+
+
 def _to_ts(value: str | None) -> int | None:
-    """Redis 里的到期时间(字符串)转 int 时间戳，无效返回 None。"""
     if not value:
         return None
     try:
@@ -117,7 +518,6 @@ def _to_ts(value: str | None) -> int | None:
 
 
 def _days_until(ts: int | None) -> int | None:
-    """到期时间戳距今天的天数，无法解析返回 None。"""
     if not ts:
         return None
     try:
@@ -127,11 +527,6 @@ def _days_until(ts: int | None) -> int | None:
 
 
 def _fetch_expiry_from_aa(secret_key: str) -> int | None:
-    """登录 AA 账户页，解析会员到期时间。
-
-    账户可能有多条会员记录，取最早到期的一条作为账号实际过期时间。
-    返回到期日 00:00 的 unix 时间戳(秒)，失败返回 None。
-    """
     try:
         session = requests.Session()
         resp = session.post(
@@ -142,8 +537,9 @@ def _fetch_expiry_from_aa(secret_key: str) -> int | None:
         )
         resp.raise_for_status()
         html = resp.text
-    except Exception as e:
-        logger.warning("拉取 AA 会员到期时间失败: id=%s err=%s", key_id(secret_key), e)
+    except Exception as exc:
+        logger.warning("Failed to fetch AA membership expiry: id=%s error=%s",
+                       key_id(secret_key), type(exc).__name__)
         return None
 
     dates: list[date] = []
@@ -153,31 +549,21 @@ def _fetch_expiry_from_aa(secret_key: str) -> int | None:
         except ValueError:
             continue
     if not dates:
-        logger.warning(
-            "AA 账户页未解析到会员到期时间: id=%s (key 可能无效或未开通会员)",
-            key_id(secret_key),
-        )
+        logger.warning("AA membership expiry not found: id=%s",
+                       key_id(secret_key))
         return None
     return int(datetime.combine(min(dates), datetime.min.time()).timestamp())
 
 
 def get_key_expiry(secret_key: str, force: bool = False) -> dict:
-    """获取单个 key 的会员到期时间。
-
-    刷新逻辑（特色：人工续费后无感刷新）：
-      - 无缓存 / force=True             → 登录三方拉取
-      - 有缓存且距今 < 刷新阈值天数      → 登录三方二次拉取（续费后能拿到新到期时间）
-      - 有缓存且距今 >= 刷新阈值天数     → 直接用缓存，不打三方
-    """
-    r = get_redis()
+    r = get_control_redis()
     kid = key_id(secret_key)
     cached = _to_ts(r.hget(KEY_EXPIRY, kid))
     cached_days = _days_until(cached)
-
     need_fetch = (
         force
         or cached is None
-        or cached_days is None                       # 缓存值损坏
+        or cached_days is None
         or cached_days < config.AA_KEY_EXPIRY_REFRESH_DAYS
     )
 
@@ -190,9 +576,7 @@ def get_key_expiry(secret_key: str, force: bool = False) -> dict:
             expiry = fetched
             source = "remote"
         else:
-            # 三方拉取失败：有旧缓存就继续用，没有则置空
             source = "cache_stale" if cached else "unknown"
-
     return {
         "id": kid,
         "expiry": expiry,
@@ -202,44 +586,8 @@ def get_key_expiry(secret_key: str, force: bool = False) -> dict:
 
 
 def check_expiry(force: bool = False) -> list[dict]:
-    """检查池内所有 key 的会员到期时间。"""
-    r = get_redis()
-    keys = sorted(r.smembers(KEY_SET), key=lambda item: key_id(item))
-    return [get_key_expiry(secret_key, force=force) for secret_key in keys]
-
-
-def available_keys() -> list[tuple[str, str]]:
-    r = get_redis()
-    keys = sorted(r.smembers(KEY_SET), key=lambda item: key_id(item))
-    result: list[tuple[str, str]] = []
-    for secret_key in keys:
-        kid = key_id(secret_key)
-        if r.exists(_disabled_key(kid)) or r.exists(_cooldown_key(kid)):
-            continue
-        result.append((kid, secret_key))
-    return result
-
-
-def unavailable_status() -> str | None:
-    """Return the business reason when the pool exists but no key is active."""
-    items = list_keys()
-    if not items:
-        return None
-    if any(item["status"] == "active" for item in items):
-        return None
-    if any(item["status"] == "cooldown" for item in items):
-        return "quota"
-    return "disabled"
-
-
-def mark_quota_exhausted(secret_key: str, reason: str) -> None:
-    kid = key_id(secret_key)
-    ttl = max(config.AA_KEY_COOLDOWN_SECONDS, 60)
-    get_redis().setex(_cooldown_key(kid), ttl, reason)
-    logger.warning("AA key quota exhausted: id=%s ttl=%ss reason=%s", kid, ttl, reason)
-
-
-def mark_disabled(secret_key: str, reason: str) -> None:
-    kid = key_id(secret_key)
-    get_redis().set(_disabled_key(kid), reason)
-    logger.error("AA key disabled: id=%s reason=%s", kid, reason)
+    secrets = _ensure_loaded()
+    return [
+        get_key_expiry(secrets[kid], force=force)
+        for kid in sorted(secrets)
+    ]

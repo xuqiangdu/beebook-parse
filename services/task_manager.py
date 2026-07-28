@@ -36,6 +36,7 @@ import json
 import hashlib
 import logging
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from parsers.factory import ParserFactory
@@ -52,6 +53,7 @@ from services.redis_store import (
 from services.book_storage import (
     find_book_file,
     get_file_extension,
+    AAUpstreamRateLimitedError,
     AAVipExpiredError,
     AADownloadQuotaExceededError,
 )
@@ -91,6 +93,27 @@ _COUNTER_KEYS = {
     "parsing":     "parse:counter:parsing",
 }
 
+_RESERVE_QUEUE_SLOT = """
+local total = 0
+for index = 1, #KEYS do
+  total = total + tonumber(redis.call('GET', KEYS[index]) or '0')
+end
+if total >= tonumber(ARGV[1]) then
+  return -1
+end
+redis.call('INCR', KEYS[1])
+return total + 1
+"""
+
+_RELEASE_LOCK_IF_OWNER = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+_INTERMEDIATE_STATES = {"pending", "downloading", "parsing", "processing"}
+
 
 def _incr_counter(r, name: str) -> int:
     return int(r.incr(_COUNTER_KEYS[name]))
@@ -103,6 +126,35 @@ def _decr_counter(r, name: str) -> int:
         r.set(_COUNTER_KEYS[name], 0)
         return 0
     return val
+
+
+def _decr_counter_once(r, name: str, task_id: str, attempt_id: str) -> int:
+    marker = f"parse:attempt:{task_id}:{attempt_id}:released:{name}"
+    if not r.set(marker, "1", nx=True, ex=config.REDIS_PARSE_TTL):
+        return int(r.get(_COUNTER_KEYS[name]) or 0)
+    return _decr_counter(r, name)
+
+
+def _reserve_queue_slot(r) -> bool:
+    result = r.eval(
+        _RESERVE_QUEUE_SLOT,
+        len(_COUNTER_KEYS),
+        _COUNTER_KEYS["queued"],
+        _COUNTER_KEYS["downloading"],
+        _COUNTER_KEYS["parsing"],
+        config.MAX_QUEUE_DEPTH,
+    )
+    return int(result) >= 0
+
+
+def _attempt_is_current(r, task_id: str, attempt_id: str,
+                        allowed_statuses: set[str] | None = None) -> bool:
+    meta = get_parse_meta(r, task_id)
+    if not meta or meta.get("attempt_id") != attempt_id:
+        return False
+    if allowed_statuses is not None and meta.get("status") not in allowed_statuses:
+        return False
+    return True
 
 
 def get_pressure() -> dict:
@@ -118,6 +170,11 @@ def get_pressure() -> dict:
             "download_capacity": config.DOWNLOAD_CONCURRENCY,
             "max_queue_depth":  config.MAX_QUEUE_DEPTH,
             "mem_percent":      _system_mem_pressure(),
+            "total_inflight": (
+                int(r.get(_COUNTER_KEYS["queued"]) or 0)
+                + int(r.get(_COUNTER_KEYS["downloading"]) or 0)
+                + int(r.get(_COUNTER_KEYS["parsing"]) or 0)
+            ),
         }
     except Exception as e:
         logger.warning(f"获取压力状态失败: {e}")
@@ -143,13 +200,19 @@ def is_overloaded(file_size: int = 0) -> tuple[bool, str]:
     r = get_redis()
     try:
         queued = int(r.get(_COUNTER_KEYS["queued"]) or 0)
+        downloading = int(r.get(_COUNTER_KEYS["downloading"]) or 0)
+        parsing = int(r.get(_COUNTER_KEYS["parsing"]) or 0)
     except Exception:
         # Redis 挂了视为不过载,让请求往后走由 submit 阶段处理
         return False, ""
 
     # 1) 队列深度兜底
-    if queued >= config.MAX_QUEUE_DEPTH:
-        return True, f"队列已满({queued}/{config.MAX_QUEUE_DEPTH})"
+    total_inflight = queued + downloading + parsing
+    if total_inflight >= config.MAX_QUEUE_DEPTH:
+        return True, (
+            f"总在途队列已满({total_inflight}/{config.MAX_QUEUE_DEPTH},"
+            f"queued={queued},downloading={downloading},parsing={parsing})"
+        )
 
     # 2) 内存压力(动态)
     mem = _system_mem_pressure()
@@ -172,14 +235,27 @@ def _lock_key(task_id: str) -> str:
     return f"parse:lock:{task_id}"
 
 
-def _try_acquire_task(r, task_id: str) -> bool:
-    """SETNX 抢锁。拿到锁的线程才入队,其余合流。"""
-    return bool(r.set(_lock_key(task_id), "1", nx=True, ex=config.PARSE_LOCK_TTL))
+def _try_acquire_task(r, task_id: str) -> str | None:
+    """Acquire the task lock and return its unique attempt generation."""
+    attempt_id = uuid.uuid4().hex
+    if r.set(
+        _lock_key(task_id),
+        attempt_id,
+        nx=True,
+        ex=config.PARSE_LOCK_TTL,
+    ):
+        return attempt_id
+    return None
 
 
-def _release_task_lock(r, task_id: str):
+def _release_task_lock(r, task_id: str, attempt_id: str):
     try:
-        r.delete(_lock_key(task_id))
+        r.eval(
+            _RELEASE_LOCK_IF_OWNER,
+            1,
+            _lock_key(task_id),
+            attempt_id,
+        )
     except Exception:
         pass
 
@@ -214,21 +290,31 @@ def submit_parse_by_md5(md5: str, extension: str = "",
         }
 
     # 2) 抢锁
-    if not _try_acquire_task(r, task_id):
+    attempt_id = _try_acquire_task(r, task_id)
+    if not attempt_id:
         # 别的线程抢到了,合流
         return {"task_id": task_id, "status": "pending",
                 "cached": False, "total_length": 0}
 
     # 3) 登记 pending,立刻入下载池(下载和解析全部异步)
+    if not _reserve_queue_slot(r):
+        _release_task_lock(r, task_id, attempt_id)
+        return {
+            "task_id": task_id,
+            "status": "rejected",
+            "cached": False,
+            "total_length": 0,
+            "overloaded": True,
+        }
     deadline_ts = int((time.time() + config.TASK_TIMEOUT_SEC) * 1000)
     filename = f"{md5}.{extension}" if extension else md5
     store_parse_pending(r, task_id, filename, extension or "",
-                        status="pending", deadline_ts=deadline_ts)
-    _incr_counter(r, "queued")
+                        status="pending", deadline_ts=deadline_ts,
+                        attempt_id=attempt_id)
 
     _download_executor.submit(
         _do_download_and_parse,
-        task_id, md5, extension, engine,
+        task_id, md5, extension, engine, attempt_id,
     )
 
     return {"task_id": task_id, "status": "pending",
@@ -266,9 +352,20 @@ def submit_parse_by_file(file_data: bytes, filename: str,
             "total_length": 0,
         }
 
-    if not _try_acquire_task(r, task_id):
+    attempt_id = _try_acquire_task(r, task_id)
+    if not attempt_id:
         return {"task_id": task_id, "status": "pending",
                 "cached": False, "total_length": 0}
+
+    if not _reserve_queue_slot(r):
+        _release_task_lock(r, task_id, attempt_id)
+        return {
+            "task_id": task_id,
+            "status": "rejected",
+            "cached": False,
+            "total_length": 0,
+            "overloaded": True,
+        }
 
     # 上传文件暂存到 uploads/(仅供解析器读取,解析完立即删)
     os.makedirs(config.UPLOAD_DIR, exist_ok=True)
@@ -279,18 +376,22 @@ def submit_parse_by_file(file_data: bytes, filename: str,
     deadline_ts = int((time.time() + config.TASK_TIMEOUT_SEC) * 1000)
     store_parse_pending(r, task_id, filename, ext,
                         status="pending", deadline_ts=deadline_ts,
-                        file_size=len(file_data))
-    _incr_counter(r, "queued")
+                        file_size=len(file_data), attempt_id=attempt_id)
 
-    update_parse_status(r, task_id, "parsing", file_size=len(file_data))
+    update_parse_status(
+        r, task_id, "parsing",
+        attempt_id=attempt_id,
+        file_size=len(file_data),
+    )
 
     # 上传场景跳过下载阶段,直接路由到对应解析池
     # delete_after=True → 解析完(无论成败)立即删临时文件
     _route_to_parse_pool(
         len(file_data),
         _do_parse,
-        task_id, upload_path, filename, ext, file_md5, len(file_data), engine, True,
-        from_queued=True,
+        task_id, upload_path, filename, ext, file_md5, len(file_data),
+        engine, True, attempt_id,
+        from_queued=True, counter_task=(task_id, attempt_id),
     )
     return {"task_id": task_id, "status": "pending",
             "cached": False, "total_length": 0}
@@ -298,7 +399,7 @@ def submit_parse_by_file(file_data: bytes, filename: str,
 
 # ─────────────── worker:下载阶段 ───────────────
 def _do_download_and_parse(task_id: str, md5: str, extension: str,
-                           engine: str | None):
+                           engine: str | None, attempt_id: str):
     """
     下载阶段 worker:
       1. 更新 status=downloading + queued-- + downloading++
@@ -306,35 +407,70 @@ def _do_download_and_parse(task_id: str, md5: str, extension: str,
       3. 路由到对应解析池
     """
     r = get_redis()
+    if not _attempt_is_current(r, task_id, attempt_id, {"pending"}):
+        _decr_counter_once(r, "queued", task_id, attempt_id)
+        _release_task_lock(r, task_id, attempt_id)
+        return
     try:
         # 状态切换:queued → downloading
-        _decr_counter(r, "queued")
+        _decr_counter_once(r, "queued", task_id, attempt_id)
         _incr_counter(r, "downloading")
-        update_parse_status(r, task_id, "downloading")
+        if not update_parse_status(
+            r, task_id, "downloading", attempt_id=attempt_id
+        ):
+            _decr_counter_once(r, "downloading", task_id, attempt_id)
+            _release_task_lock(r, task_id, attempt_id)
+            return
 
         try:
-            filepath, dl_error = find_book_file(md5, extension)
+            filepath, dl_error = find_book_file(
+                md5,
+                extension,
+                publish_guard=lambda: _attempt_is_current(
+                    r,
+                    task_id,
+                    attempt_id,
+                    {"downloading"},
+                ),
+            )
         except AAVipExpiredError as e:
-            _decr_counter(r, "downloading")
+            _decr_counter_once(r, "downloading", task_id, attempt_id)
             store_parse_error(
                 r, task_id, str(e),
                 f"{md5}.{extension or '?'}", extension or "",
                 code=CODE_VIP_EXPIRED,
+                attempt_id=attempt_id,
+                next_probe_at=e.next_probe_at,
+                retry_after_seconds=e.retry_after_seconds,
             )
-            _release_task_lock(r, task_id)
+            _release_task_lock(r, task_id, attempt_id)
             return
         except AADownloadQuotaExceededError as e:
-            _decr_counter(r, "downloading")
+            _decr_counter_once(r, "downloading", task_id, attempt_id)
             store_parse_error(
                 r, task_id, str(e),
                 f"{md5}.{extension or '?'}", extension or "",
                 code=CODE_DOWNLOAD_QUOTA_EXCEEDED,
+                attempt_id=attempt_id,
+                next_probe_at=e.next_probe_at,
+                retry_after_seconds=e.retry_after_seconds,
             )
-            _release_task_lock(r, task_id)
+            _release_task_lock(r, task_id, attempt_id)
+            return
+        except AAUpstreamRateLimitedError as e:
+            _decr_counter_once(r, "downloading", task_id, attempt_id)
+            store_parse_error(
+                r, task_id, str(e),
+                f"{md5}.{extension or '?'}", extension or "",
+                code=429,
+                attempt_id=attempt_id,
+                retry_after_seconds=e.retry_after_seconds,
+            )
+            _release_task_lock(r, task_id, attempt_id)
             return
 
         if filepath is None:
-            _decr_counter(r, "downloading")
+            _decr_counter_once(r, "downloading", task_id, attempt_id)
             # ⭐ errorMsg 透出:把 find_book_file 收集到的真实失败原因带给上游
             reason_suffix = f"(原因: {dl_error})" if dl_error else ""
             store_parse_error(
@@ -343,8 +479,9 @@ def _do_download_and_parse(task_id: str, md5: str, extension: str,
                 f"{md5}.{extension or '?'}",
                 extension or "",
                 code=502,  # 下载/上游问题
+                attempt_id=attempt_id,
             )
-            _release_task_lock(r, task_id)
+            _release_task_lock(r, task_id, attempt_id)
             return
 
         if not extension:
@@ -353,38 +490,58 @@ def _do_download_and_parse(task_id: str, md5: str, extension: str,
         file_size = os.path.getsize(filepath)
 
         # 状态切换:downloading → 路由到解析池
-        _decr_counter(r, "downloading")
-        update_parse_status(r, task_id, "parsing", file_size=file_size)
+        _decr_counter_once(r, "downloading", task_id, attempt_id)
+        if not update_parse_status(
+            r, task_id, "parsing",
+            attempt_id=attempt_id,
+            file_size=file_size,
+        ):
+            _release_task_lock(r, task_id, attempt_id)
+            return
 
         # delete_after=False:原书由 books/ TTL 机制统一管理,不在解析后删除
         _route_to_parse_pool(
             file_size,
             _do_parse,
-            task_id, filepath, filename, extension, md5, file_size, engine, False,
+            task_id, filepath, filename, extension, md5, file_size,
+            engine, False, attempt_id,
+            counter_task=(task_id, attempt_id),
         )
     except Exception as e:
         logger.exception(f"下载阶段异常: task_id={task_id}")
         try:
-            _decr_counter(r, "downloading")
+            _decr_counter_once(r, "downloading", task_id, attempt_id)
         except Exception:
             pass
         store_parse_error(
             r, task_id, f"下载异常: {e}",
             f"{md5}.{extension or '?'}", extension or "", code=502,
+            attempt_id=attempt_id,
         )
-        _release_task_lock(r, task_id)
+        _release_task_lock(r, task_id, attempt_id)
 
 
-def _route_to_parse_pool(file_size: int, fn, *args, from_queued: bool = False):
+def _route_to_parse_pool(file_size: int, fn, *args,
+                         from_queued: bool = False,
+                         counter_task: tuple[str, str] | None = None):
     """按文件大小路由到小池或大池"""
     r = get_redis()
+    if counter_task:
+        task_id, attempt_id = counter_task
+        if not _attempt_is_current(r, task_id, attempt_id, {"parsing"}):
+            if from_queued:
+                _decr_counter_once(r, "queued", task_id, attempt_id)
+            _release_task_lock(r, task_id, attempt_id)
+            return False
     if from_queued:
-        _decr_counter(r, "queued")
+        task_id, attempt_id = counter_task
+        _decr_counter_once(r, "queued", task_id, attempt_id)
     _incr_counter(r, "parsing")
     if file_size > config.LARGE_FILE_THRESHOLD:
         _parse_large_executor.submit(_track_future, fn, *args)
     else:
         _parse_small_executor.submit(_track_future, fn, *args)
+    return True
 
 
 def _track_future(fn, *args):
@@ -398,7 +555,7 @@ def _track_future(fn, *args):
 # ─────────────── worker:解析阶段 ───────────────
 def _do_parse(task_id: str, filepath: str, filename: str, ext: str,
               file_md5: str, file_size: int, engine: str | None = None,
-              delete_after: bool = False):
+              delete_after: bool = False, attempt_id: str = ""):
     """
     线程池内执行的解析逻辑(v2:计数器 + 状态切换)
 
@@ -407,6 +564,10 @@ def _do_parse(task_id: str, filepath: str, filename: str, ext: str,
     """
     r = get_redis()
     try:
+        if not _attempt_is_current(
+            r, task_id, attempt_id, {"parsing", "processing"}
+        ):
+            return
         handler, detected_ext = _factory.detect_and_get_handler(filepath, filename)
         if engine:
             handler = _factory.get_handler(detected_ext or ext, engine)
@@ -415,7 +576,7 @@ def _do_parse(task_id: str, filepath: str, filename: str, ext: str,
             store_parse_error(
                 r, task_id,
                 f"不支持的格式: {ext},支持: {', '.join(_factory.supported_formats().keys())}",
-                filename, ext, code=501,
+                filename, ext, code=501, attempt_id=attempt_id,
             )
             return
 
@@ -424,7 +585,10 @@ def _do_parse(task_id: str, filepath: str, filename: str, ext: str,
         elapsed_ms = round((time.time() - start) * 1000, 2)
 
         if not result.success:
-            store_parse_error(r, task_id, result.error, filename, ext, code=501)
+            store_parse_error(
+                r, task_id, result.error, filename, ext,
+                code=501, attempt_id=attempt_id,
+            )
             return
 
         # 归一化:压掉多余空行 + 合并极端短行碎片(可通过 TEXT_NORMALIZE=0 关闭)
@@ -433,23 +597,26 @@ def _do_parse(task_id: str, filepath: str, filename: str, ext: str,
         saved = orig_len - len(text)
 
         # 结果只进 Redis,不落盘(本服务无状态,TTL 到期自动失效)
-        store_parse_result(
+        stored = store_parse_result(
             r, task_id, text, result.engine,
             filename, file_md5, file_size, elapsed_ms, ext,
+            attempt_id=attempt_id,
         )
 
-        logger.info(
-            f"解析完成: {filename} [{ext}] {file_size}B → {len(text)}字符 "
-            f"{elapsed_ms}ms (归一化省 {saved}字符)"
-        )
+        if stored:
+            logger.info(
+                f"解析完成: {filename} [{ext}] {file_size}B → {len(text)}字符 "
+                f"{elapsed_ms}ms (归一化省 {saved}字符)"
+            )
 
     except Exception as e:
         logger.exception(f"解析异常: {filename}")
         store_parse_error(r, task_id, f"内部错误: {str(e)}",
-                          filename, ext, code=500)
+                          filename, ext, code=500,
+                          attempt_id=attempt_id)
     finally:
-        _decr_counter(r, "parsing")
-        _release_task_lock(r, task_id)
+        _decr_counter_once(r, "parsing", task_id, attempt_id)
+        _release_task_lock(r, task_id, attempt_id)
         # 上传场景:不管成败都清理临时文件
         if delete_after:
             try:
@@ -609,6 +776,7 @@ def _watchdog_loop():
 
                 # 根据原状态判断是 download 阶段还是 parse 阶段超时
                 old_status = meta.get("status", "")
+                attempt_id = meta.get("attempt_id")
                 store_parse_error(
                     r, task_id,
                     f"任务超时(>{config.TASK_TIMEOUT_SEC}s,卡在 {old_status} 阶段),"
@@ -616,16 +784,27 @@ def _watchdog_loop():
                     meta.get("filename", ""),
                     meta.get("format", ""),
                     code=504,
+                    attempt_id=attempt_id,
                 )
                 # counter 回收(对应阶段)
+                counter_name = None
                 if old_status == "downloading":
-                    _decr_counter(r, "downloading")
+                    counter_name = "downloading"
                 elif old_status in ("parsing", "processing"):
-                    _decr_counter(r, "parsing")
+                    counter_name = "parsing"
                 elif old_status == "pending":
-                    _decr_counter(r, "queued")
+                    counter_name = "queued"
+                if counter_name and attempt_id:
+                    _decr_counter_once(
+                        r, counter_name, task_id, attempt_id
+                    )
+                elif counter_name:
+                    _decr_counter(r, counter_name)
                 # 释放锁,允许重提
-                _release_task_lock(r, task_id)
+                if attempt_id:
+                    _release_task_lock(r, task_id, attempt_id)
+                else:
+                    r.delete(_lock_key(task_id))
                 timed_out += 1
                 logger.warning(
                     f"看门狗超时终止: task_id={task_id} 阶段={old_status}"

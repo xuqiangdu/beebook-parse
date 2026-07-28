@@ -18,6 +18,22 @@ import redis
 
 import config
 
+_FENCED_SET_META = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+  return 0
+end
+local current = cjson.decode(raw)
+if current['attempt_id'] ~= ARGV[1] then
+  return 0
+end
+if current['status'] == 'failed' or current['status'] == 'completed' then
+  return 0
+end
+redis.call('SETEX', KEYS[1], tonumber(ARGV[2]), ARGV[3])
+return 1
+"""
+
 
 def get_redis() -> redis.Redis:
     return redis.Redis(
@@ -29,7 +45,42 @@ def get_redis() -> redis.Redis:
     )
 
 
-def _chunk_key(task_id: str, index: int) -> str:
+def get_control_redis() -> redis.Redis:
+    """Return the non-evictable Redis used by the Anna account control plane."""
+    if not config.CONTROL_REDIS_HOST:
+        raise RuntimeError("CONTROL_REDIS_HOST is required")
+    return redis.Redis(
+        host=config.CONTROL_REDIS_HOST,
+        port=config.CONTROL_REDIS_PORT,
+        db=config.CONTROL_REDIS_DB,
+        password=config.CONTROL_REDIS_PASSWORD,
+        decode_responses=True,
+    )
+
+
+def validate_control_redis() -> dict:
+    """Verify that Anna control state cannot be evicted."""
+    client = get_control_redis()
+    client.ping()
+    policy = (
+        client.config_get("maxmemory-policy").get("maxmemory-policy")
+        or ""
+    ).lower()
+    if policy != "noeviction":
+        raise RuntimeError(
+            "control Redis maxmemory-policy must be noeviction"
+        )
+    return {
+        "host": config.CONTROL_REDIS_HOST,
+        "port": config.CONTROL_REDIS_PORT,
+        "db": config.CONTROL_REDIS_DB,
+        "maxmemory_policy": policy,
+    }
+
+
+def _chunk_key(task_id: str, index: int, attempt_id: str | None = None) -> str:
+    if attempt_id:
+        return f"parse:{task_id}:attempt:{attempt_id}:chunk:{index}"
     return f"parse:{task_id}:chunk:{index}"
 
 
@@ -37,10 +88,26 @@ def _meta_key(task_id: str) -> str:
     return f"parse:{task_id}:meta"
 
 
+def _set_meta(r: redis.Redis, task_id: str, meta: dict, ttl: int,
+              attempt_id: str | None = None) -> bool:
+    raw = json.dumps(meta, ensure_ascii=False)
+    if not attempt_id:
+        r.setex(_meta_key(task_id), ttl, raw)
+        return True
+    return bool(r.eval(
+        _FENCED_SET_META,
+        1,
+        _meta_key(task_id),
+        attempt_id,
+        ttl,
+        raw,
+    ))
+
+
 def store_parse_result(r: redis.Redis, task_id: str, text: str,
                        engine: str, filename: str, file_md5: str,
                        file_size: int, parse_time_ms: float,
-                       fmt: str):
+                       fmt: str, attempt_id: str | None = None) -> bool:
     """
     将解析结果存入 Redis，大文本自动拆分。
     """
@@ -57,7 +124,8 @@ def store_parse_result(r: redis.Redis, task_id: str, text: str,
     # 用 pipeline 批量写入
     pipe = r.pipeline()
     for i, chunk in enumerate(chunks):
-        pipe.setex(_chunk_key(task_id, i), ttl, chunk)
+        pipe.setex(_chunk_key(task_id, i, attempt_id), ttl, chunk)
+    pipe.execute()
 
     # 写入 meta
     meta = {
@@ -71,12 +139,24 @@ def store_parse_result(r: redis.Redis, task_id: str, text: str,
         "parse_time_ms": parse_time_ms,
         "format": fmt,
     }
-    pipe.setex(_meta_key(task_id), ttl, json.dumps(meta, ensure_ascii=False))
-    pipe.execute()
+    if attempt_id:
+        meta["attempt_id"] = attempt_id
+        meta["chunk_attempt_id"] = attempt_id
+    stored = _set_meta(r, task_id, meta, ttl, attempt_id=attempt_id)
+    if not stored:
+        stale_keys = [
+            _chunk_key(task_id, i, attempt_id)
+            for i in range(len(chunks))
+        ]
+        if stale_keys:
+            r.delete(*stale_keys)
+    return stored
 
 
 def store_parse_error(r: redis.Redis, task_id: str, error: str,
-                      filename: str, fmt: str, code: int = 501):
+                      filename: str, fmt: str, code: int = 501,
+                      attempt_id: str | None = None,
+                      **extra_fields) -> bool:
     """
     存储解析失败信息
     code: 失败类型,用于客户端区分
@@ -91,14 +171,23 @@ def store_parse_error(r: redis.Redis, task_id: str, error: str,
         "chunks": 0,
         "total_length": 0,
     }
-    r.setex(_meta_key(task_id), config.REDIS_PARSE_TTL,
-            json.dumps(meta, ensure_ascii=False))
+    if attempt_id:
+        meta["attempt_id"] = attempt_id
+    meta.update(extra_fields)
+    return _set_meta(
+        r,
+        task_id,
+        meta,
+        config.REDIS_PARSE_TTL,
+        attempt_id=attempt_id,
+    )
 
 
 def store_parse_pending(r: redis.Redis, task_id: str, filename: str, fmt: str,
                         status: str = "pending",
                         deadline_ts: int | None = None,
-                        file_size: int = 0):
+                        file_size: int = 0,
+                        attempt_id: str | None = None):
     """
     标记任务为某个中间状态(v2 状态机)
     status: pending / downloading / parsing / processing(兼容)
@@ -116,11 +205,14 @@ def store_parse_pending(r: redis.Redis, task_id: str, filename: str, fmt: str,
         meta["deadline_ts"] = deadline_ts
     if file_size:
         meta["file_size"] = file_size
+    if attempt_id:
+        meta["attempt_id"] = attempt_id
     r.setex(_meta_key(task_id), config.REDIS_PARSE_TTL,
             json.dumps(meta, ensure_ascii=False))
 
 
 def update_parse_status(r: redis.Redis, task_id: str, status: str,
+                        attempt_id: str | None = None,
                         **extra_fields):
     """
     更新任务状态(状态机流转用),保留已有字段,只覆盖 status 和传入的字段。
@@ -132,15 +224,16 @@ def update_parse_status(r: redis.Redis, task_id: str, status: str,
     try:
         meta = json.loads(raw)
     except Exception:
-        return
+        return False
+    if attempt_id and meta.get("attempt_id") != attempt_id:
+        return False
     meta["status"] = status
     meta.update(extra_fields)
     # 保留原 TTL(用 setex 重设也行,这里取剩余 TTL)
     ttl = r.ttl(_meta_key(task_id))
     if ttl is None or ttl < 0:
         ttl = config.REDIS_PARSE_TTL
-    r.setex(_meta_key(task_id), ttl,
-            json.dumps(meta, ensure_ascii=False))
+    return _set_meta(r, task_id, meta, ttl, attempt_id=attempt_id)
 
 
 def get_parse_meta(r: redis.Redis, task_id: str) -> dict | None:
@@ -164,8 +257,9 @@ def get_parse_text(r: redis.Redis, task_id: str, meta: dict = None) -> str | Non
 
     # 批量读取所有 chunk
     pipe = r.pipeline()
+    chunk_attempt_id = meta.get("chunk_attempt_id")
     for i in range(chunk_count):
-        pipe.get(_chunk_key(task_id, i))
+        pipe.get(_chunk_key(task_id, i, chunk_attempt_id))
     parts = pipe.execute()
 
     return "".join(part or "" for part in parts)
@@ -176,6 +270,7 @@ def delete_parse_result(r: redis.Redis, task_id: str):
     meta = get_parse_meta(r, task_id)
     keys = [_meta_key(task_id)]
     if meta:
+        chunk_attempt_id = meta.get("chunk_attempt_id")
         for i in range(meta.get("chunks", 0)):
-            keys.append(_chunk_key(task_id, i))
+            keys.append(_chunk_key(task_id, i, chunk_attempt_id))
     r.delete(*keys)

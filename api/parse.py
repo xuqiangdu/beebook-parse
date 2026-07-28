@@ -11,6 +11,8 @@ GET  /api/pressure           查看当前服务负载(v2)
 响应统一用 api/common.py 的包装:{code, data, message, timestamp}
 """
 
+import time
+
 from flask import Blueprint, request
 
 from services.task_manager import (
@@ -35,6 +37,13 @@ _factory = ParserFactory()
 
 # v2 中间状态全集(客户端轮询时这些都返回 code=0)
 INTERMEDIATE_STATES = {"pending", "downloading", "parsing", "processing"}
+
+
+def _current_retry_after(meta: dict, default: int = 0) -> int:
+    next_probe_at = int(meta.get("next_probe_at") or 0)
+    if next_probe_at > 0:
+        return max(next_probe_at - int(time.time()), 0)
+    return max(int(meta.get("retry_after_seconds") or default), 0)
 
 
 @parse_bp.route("/api/parse", methods=["POST"])
@@ -67,6 +76,14 @@ def create_parse_task():
         )
 
     result = submit_parse_by_md5(md5, extension, engine)
+    if result.get("overloaded"):
+        return api_err(
+            CODE_OVERLOADED,
+            "服务繁忙: 总在途任务已满,请稍后重试",
+            http_status=429,
+            data=get_pressure(),
+            headers={"Retry-After": "5"},
+        )
     if "error" in result:
         return api_err(CODE_NOT_FOUND, result["error"], http_status=404)
 
@@ -102,6 +119,14 @@ def upload_and_parse():
 
     engine = request.args.get("engine")
     result = submit_parse_by_file(file_data, file.filename, engine)
+    if result.get("overloaded"):
+        return api_err(
+            CODE_OVERLOADED,
+            "服务繁忙: 总在途任务已满,请稍后重试",
+            http_status=429,
+            data=get_pressure(),
+            headers={"Retry-After": "5"},
+        )
     return api_ok(result)
 
 
@@ -122,7 +147,16 @@ def poll_parse_task(task_id):
     if meta is None:
         return api_err(CODE_NOT_FOUND, "任务不存在或已过期", http_status=404)
 
-    payload = {"task_id": task_id, **meta}
+    public_meta = {
+        key: value for key, value in meta.items()
+        if key not in {"attempt_id", "chunk_attempt_id"}
+    }
+    if (
+        "next_probe_at" in public_meta
+        or "retry_after_seconds" in public_meta
+    ):
+        public_meta["retry_after_seconds"] = _current_retry_after(meta)
+    payload = {"task_id": task_id, **public_meta}
 
     status = meta.get("status")
     if status == "completed":
@@ -143,18 +177,31 @@ def poll_parse_task(task_id):
         if error_code == CODE_TIMEOUT:
             return api_err(CODE_TIMEOUT, meta.get("error", "任务超时"),
                            data=payload)
+        if error_code == CODE_OVERLOADED:
+            retry_after = _current_retry_after(meta, 5)
+            return api_err(
+                CODE_OVERLOADED,
+                meta.get("error", "上游限流"),
+                http_status=429,
+                data=payload,
+                headers={"Retry-After": str(max(retry_after, 1))},
+            )
         if error_code == CODE_UPSTREAM_FAIL:
             return api_err(CODE_UPSTREAM_FAIL,
                            meta.get("error", "上游/下载失败"),
                            http_status=502, data=payload)
         if error_code == CODE_VIP_EXPIRED:
+            retry_after = _current_retry_after(meta)
+            headers = {"Retry-After": str(retry_after)} if retry_after > 0 else None
             return api_err(CODE_VIP_EXPIRED,
                            meta.get("error", "AA 账号 VIP 过期或未开通"),
-                           http_status=403, data=payload)
+                           http_status=403, data=payload, headers=headers)
         if error_code == CODE_DOWNLOAD_QUOTA_EXCEEDED:
+            retry_after = _current_retry_after(meta)
+            headers = {"Retry-After": str(retry_after)} if retry_after > 0 else None
             return api_err(CODE_DOWNLOAD_QUOTA_EXCEEDED,
                            meta.get("error", "AA 账号当日下载额度用尽"),
-                           http_status=429, data=payload)
+                           http_status=429, data=payload, headers=headers)
         return api_err(CODE_PARSE_FAILED, meta.get("error", "解析失败"),
                        data=payload)
 

@@ -33,10 +33,22 @@ cp .env.example .env
 vi .env
 ```
 
-填入你的 Anna's Archive VIP Secret Key：
-```
-AA_SECRET_KEY=你的key
-```
+Anna 账号只允许配置在未跟踪的 `.env` 或部署平台环境变量中：
+
+- 单账号使用 `AA_SECRET_KEY`
+- 多账号使用逗号分隔的 `AA_SECRET_KEYS`
+- 脱敏账号池健康接口使用独立的 `AA_KEY_ADMIN_SECRET`
+
+新增或替换账号后必须重启服务。原始账号 Key 不写入 Redis、API
+响应、日志、代码、测试或文档；Redis 只保存不可逆账号 ID 和状态。
+
+生产部署必须设置 `CONTROL_REDIS_HOST` 指向不淘汰数据的独立 Redis。
+默认 Compose 已包含 `redis-control`，用于账号池轮转、冷却和下载租约。
+未配置、不可达或不是 `noeviction` 时，Anna 下载会 fail-closed 并返回
+429，不会退回进程内限流。相同 MD5 使用分布式内容锁，下载先写唯一
+`.part.*` 文件，长度校验通过后才原子发布，半文件不会进入缓存。
+默认拒绝小于 32 字节的原文件，避免第三方占位文本进入书籍缓存；可通过
+`MIN_BOOK_FILE_BYTES` 调整阈值。
 
 ### 2. 启动服务
 
@@ -51,6 +63,10 @@ docker compose up -d
 ```bash
 # 健康检查
 curl http://localhost:5555/health
+
+# 账号池脱敏健康状态（只读）
+curl -H "X-Admin-Secret: <admin-secret>" \
+  http://localhost:5555/api/admin/aa-keys/health
 
 # 搜索
 curl "http://localhost:5555/api/search?q=python&ext=pdf"
