@@ -120,6 +120,47 @@ def test_search_books_applies_single_request_fallback(
     assert result["results"][0]["extension"] == "epub"
 
 
+def test_search_books_does_not_return_partial_matches(
+    monkeypatch, search_service
+):
+    partial_md5 = "6" * 32
+    html = (
+        _search_html()
+        + '<div class="js-partial-matches-remove">'
+        + "<button>Show 1 partial matches</button>"
+        + _card(partial_md5, "English [en] · EPUB · 1.5MB")
+        + "</div>"
+    )
+
+    class Response:
+        status_code = 200
+        text = html
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    monkeypatch.setattr(
+        search_service,
+        "_alive_mirrors",
+        ["https://anna-search.invalid"],
+    )
+    monkeypatch.setattr(
+        search_service._session,
+        "get",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    result = search_service.search_books(
+        query="missing exact title",
+        lang=["en"],
+        ext=["epub"],
+    )
+
+    assert result["total"] == 0
+    assert result["results"] == []
+
+
 def test_page_language_and_extension_win_over_request_fallback(search_service):
     info = search_service._parse_meta("English [en] · PDF · 3MB")
 
