@@ -241,21 +241,24 @@ def search_books(
     fallback_language = _single_requested_language(lang)
     fallback_extension = _single_requested_extension(ext)
 
-    # 先用 BeautifulSoup 解析，失败时降级到正则
+    # Only the BS4 parser is allowed here because it is scoped to Anna's exact
+    # result container. A page-wide regex fallback would include hidden partial
+    # matches and return unrelated books.
     try:
         result = _parse_with_bs4(html)
-        if result["results"]:
-            _apply_requested_fallbacks(
-                result["results"],
-                fallback_language,
-                fallback_extension,
-            )
-            return result
-        logger.warning("BS4 解析无结果，降级到正则")
     except Exception as e:
-        logger.warning(f"BS4 解析异常，降级到正则: {e}")
+        logger.error(f"BS4 精确结果解析异常: {e}")
+        return {
+            "total": 0,
+            "results": [],
+            "error": f"搜索页精确结果解析失败: {e}",
+        }
 
-    result = _parse_with_regex(html)
+    # Anna renders partial matches outside .js-aarecord-list-outer. An empty
+    # exact container is a valid empty search result, not a parser failure.
+    if not result["results"]:
+        return {"total": 0, "results": []}
+
     _apply_requested_fallbacks(
         result["results"],
         fallback_language,
