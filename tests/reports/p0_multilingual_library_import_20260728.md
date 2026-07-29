@@ -40,7 +40,7 @@ AA_SECRET_KEYS= \
 结果：
 
 ```text
-34 passed in 11.75s
+41 passed in 100.97s
 ```
 
 覆盖：
@@ -77,10 +77,28 @@ AA_SECRET_KEYS= \
 23 个真实成功下载文件已从仓库移到
 `/tmp/codex-real-anna-distinct-20260728`，未直接删除，可恢复。
 
+### 新账号低消耗复验（2026-07-29）
+
+旧账号额度耗尽后，新账号只写入 Git 忽略的 `.env`，并复用现有
+`beebook-app` / `beebook-redis` 容器：
+
+1. 搜索 `Jane Eyre Charlotte Bronte`，语言 `en`、格式 `epub`；
+2. 冷解析第一条 MD5 `726151271cb80d30a6a2009105c1fc49`：
+   `cached=false`、1,010,114B、正文 1,041,343 字符、
+   `parse_time_ms=156.57`、completed；
+3. 重建并重启最终代码后再次提交同一 MD5：
+   HTTP 200、业务 code 0、`cached=true`；
+4. 账号健康状态保持 `configured=1, active=1`，缓存命中没有再次更新
+   `last_success_at`，因此没有第二次调用 Anna 下载。
+
+本轮只消耗一条独立内容下载。额度耗尽、多账号切换和瞬态错误仍由本地假
+上游测试，不再用真实账号重复撞额度。
+
 ## 静态和部署校验
 
 ```text
 python syntax ok
+pytest: 41 passed
 git diff --check: passed
 docker compose --env-file /dev/null config --quiet: passed
 ```

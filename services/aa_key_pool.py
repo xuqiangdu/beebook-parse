@@ -231,6 +231,27 @@ def available_keys() -> list[tuple[str, str]]:
     return result
 
 
+def key_is_available(kid: str) -> bool:
+    """Recheck one selected account immediately before an upstream call."""
+    secrets = _ensure_loaded()
+    if kid not in secrets:
+        return False
+
+    r = get_redis()
+    state = _state_for(r, kid)
+    status = state.get("status") or "active"
+    if status == "active":
+        return True
+
+    next_probe_at = _to_int(state.get("next_probe_at"))
+    if next_probe_at <= 0 or next_probe_at > int(time.time()):
+        return False
+
+    # available_keys() creates this lease for a due probe. A selected probe
+    # remains valid only while that lease is still alive.
+    return bool(r.exists(_probe_lease_key(kid)))
+
+
 def unavailable_info() -> dict:
     """Describe the current pool-level business state without secrets."""
     items = list_keys()

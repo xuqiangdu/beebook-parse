@@ -21,6 +21,7 @@ from services.aa_key_pool import (
     AnnaContentBusyError,
     anna_content_lock,
     available_keys,
+    key_is_available,
     mark_disabled,
     mark_quota_exhausted,
     mark_success,
@@ -39,6 +40,17 @@ OSS_BASE_URL = os.getenv("OSS_BASE_URL", "")
 
 # Reject obvious placeholder/error bodies before they become durable book cache.
 MIN_BOOK_FILE_BYTES = max(int(os.getenv("MIN_BOOK_FILE_BYTES", "32")), 1)
+
+_MEMBERSHIP_ERROR_MARKERS = (
+    "not a member",
+    "membership expired",
+    "membership inactive",
+    "vip expired",
+    "会员已过期",
+    "会员已失效",
+    "未开通会员",
+    "不是会员",
+)
 
 
 class AAVipExpiredError(Exception):
@@ -71,6 +83,24 @@ class AAUpstreamRateLimitedError(Exception):
 
 def _redact_secret(value: str, secret_key: str) -> str:
     return str(value or "").replace(secret_key, "[redacted]")
+
+
+def _is_membership_error(value) -> bool:
+    normalized = " ".join(str(value or "").casefold().split())
+    return any(marker in normalized for marker in _MEMBERSHIP_ERROR_MARKERS)
+
+
+def _remove_if_same_file(path: str, published_stat: os.stat_result) -> None:
+    """Remove an expired publication without deleting a newer replacement."""
+    try:
+        current_stat = os.stat(path, follow_symlinks=False)
+        if (
+            current_stat.st_dev == published_stat.st_dev
+            and current_stat.st_ino == published_stat.st_ino
+        ):
+            os.remove(path)
+    except FileNotFoundError:
+        pass
 
 
 def find_book_file(
@@ -189,6 +219,9 @@ def _download_from_aa_pool(books_dir: str, md5: str, extension: str,
     reasons: list[str] = []
 
     for kid, secret_key in aa_keys:
+        if not key_is_available(kid):
+            reasons.append(f"key={kid} unavailable")
+            continue
         try:
             if publish_guard is None:
                 path, err = _download_from_aa(
@@ -253,7 +286,7 @@ def _download_from_aa_pool(books_dir: str, md5: str, extension: str,
             next_probe_at=info["next_probe_at"],
             retry_after_seconds=info["retry_after_seconds"],
         )
-    if disabled_errors or info["reason"] == "disabled":
+    if disabled_errors or info["reason"] in {"disabled", "unconfigured"}:
         raise AAVipExpiredError(
             "AA 账号 VIP 过期、未开通或 key 异常",
             next_probe_at=info["next_probe_at"],
@@ -291,7 +324,7 @@ def _download_from_aa(books_dir: str, md5: str, extension: str,
             err_body = {}
         err_text = err_body.get("error", "")
         if e.code in (401, 403):
-            if err_text == "Not a member":
+            if _is_membership_error(err_text):
                 raise AAVipExpiredError("AA 账号 VIP 过期或未开通") from e
             reason = _redact_secret(
                 f"API HTTP {e.code} {err_text or e.reason}",
@@ -375,7 +408,11 @@ def _download_from_aa(books_dir: str, md5: str, extension: str,
             )
         if publish_guard is not None and not publish_guard():
             return None, "下载任务已过期,放弃发布缓存"
+        published_stat = os.stat(part_path, follow_symlinks=False)
         os.replace(part_path, local_path)
+        if publish_guard is not None and not publish_guard():
+            _remove_if_same_file(local_path, published_stat)
+            return None, "下载任务发布期间已过期,已清理缓存"
         if (
             os.path.exists(local_path)
             and os.path.getsize(local_path) >= MIN_BOOK_FILE_BYTES
@@ -455,7 +492,21 @@ def _download_from_oss(books_dir: str, md5: str,
                         ):
                             last_err = f"{filename} 任务已过期"
                             continue
+                        published_stat = os.stat(
+                            part_path,
+                            follow_symlinks=False,
+                        )
                         os.replace(part_path, local_path)
+                        if (
+                            publish_guard is not None
+                            and not publish_guard()
+                        ):
+                            _remove_if_same_file(
+                                local_path,
+                                published_stat,
+                            )
+                            last_err = f"{filename} 发布期间任务已过期"
+                            continue
                         logger.info(f"OSS 下载成功: {filename}")
                         return local_path, None
                     last_err = (

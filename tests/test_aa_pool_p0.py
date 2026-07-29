@@ -15,6 +15,7 @@ from flask import Flask
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import api.parse as parse_api
 from api.aa_keys import aa_keys_bp
 from api.parse import parse_bp
 from services import aa_key_pool, book_storage
@@ -28,6 +29,8 @@ from services.redis_store import (
 from services.task_manager import (
     _COUNTER_KEYS,
     _decr_counter_once,
+    _do_download_and_parse,
+    _lock_key,
     _release_task_lock,
     _reserve_queue_slot,
     is_overloaded,
@@ -273,6 +276,38 @@ def test_account_selection_happens_inside_content_lock(monkeypatch):
     assert events.index("accounts") < events.index("content-exit")
 
 
+@pytest.mark.parametrize("unavailable_state", ["cooldown", "disabled"])
+def test_selected_account_is_rechecked_before_download(
+    monkeypatch, tmp_path, account_pool, unavailable_state
+):
+    aa_keys = aa_key_pool.available_keys()
+    stale_kid, stale_secret = aa_keys[0]
+    fresh_kid, fresh_secret = aa_keys[1]
+    if unavailable_state == "cooldown":
+        aa_key_pool.mark_quota_exhausted(stale_secret, "quota")
+    else:
+        aa_key_pool.mark_disabled(stale_secret, "membership")
+
+    called = []
+
+    def fake_download(_dir, _md5, _ext, secret_key, _label):
+        called.append(secret_key)
+        return str(tmp_path / "book.pdf"), None
+
+    monkeypatch.setattr(book_storage, "_download_from_aa", fake_download)
+    path, error = book_storage._download_from_aa_pool(
+        str(tmp_path),
+        "d" * 32,
+        "pdf",
+        aa_keys,
+    )
+
+    assert path == str(tmp_path / "book.pdf")
+    assert error is None
+    assert called == [fresh_secret]
+    assert stale_kid != fresh_kid
+
+
 def test_total_inflight_backpressure_and_atomic_reservation(
     monkeypatch, redis_client
 ):
@@ -387,6 +422,63 @@ def test_parse_business_codes_include_next_probe_and_retry_after(redis_client):
         retry_after = int(response.headers["Retry-After"])
         assert 1 <= retry_after <= 60
         assert body["data"]["retry_after_seconds"] == retry_after
+
+
+def test_retry_after_decreases_from_next_probe_at(monkeypatch):
+    now = {"value": 1_000}
+    monkeypatch.setattr(
+        parse_api.time,
+        "time",
+        lambda: now["value"],
+    )
+    meta = {
+        "next_probe_at": 1_060,
+        "retry_after_seconds": 999,
+    }
+
+    assert parse_api._current_retry_after(meta) == 60
+    now["value"] = 1_025
+    assert parse_api._current_retry_after(meta) == 35
+    now["value"] = 1_061
+    assert parse_api._current_retry_after(meta) == 0
+
+
+def test_unconfigured_accounts_are_stored_as_10001(
+    monkeypatch, redis_client
+):
+    monkeypatch.setattr(config, "AA_SECRET_KEY", "")
+    monkeypatch.setattr(config, "AA_SECRET_KEYS", "")
+    monkeypatch.setattr(book_storage, "OSS_BASE_URL", "")
+    aa_key_pool.seed_keys_from_env()
+    md5 = secrets.token_hex(16)
+    task_id = f"{md5}_default"
+    attempt_id = secrets.token_hex(16)
+    redis_client.set(
+        _lock_key(task_id),
+        attempt_id,
+        ex=config.PARSE_LOCK_TTL,
+    )
+    redis_client.set(_COUNTER_KEYS["queued"], 1)
+    store_parse_pending(
+        redis_client,
+        task_id,
+        f"{md5}.pdf",
+        "pdf",
+        status="pending",
+        attempt_id=attempt_id,
+    )
+
+    _do_download_and_parse(
+        task_id,
+        md5,
+        "pdf",
+        None,
+        attempt_id,
+    )
+
+    meta = get_parse_meta(redis_client, task_id)
+    assert meta["status"] == "failed"
+    assert meta["error_code"] == 10001
 
 
 def test_redacted_read_only_health_endpoint(
@@ -509,6 +601,19 @@ class _FakeAnnaTinyDownloadHandler(_FakeAnnaDownloadHandler):
 class _FakeAnnaUnknownForbiddenHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = json.dumps({"error": "temporary authorization issue"}).encode()
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        return
+
+
+class _FakeAnnaMembershipExpiredHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"error": "Membership expired"}).encode()
         self.send_response(403)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -650,6 +755,89 @@ def test_stale_attempt_cannot_publish_download_cache(
         thread.join(timeout=2)
 
 
+def test_attempt_expiring_during_publish_removes_published_cache(
+    monkeypatch, tmp_path
+):
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        _FakeAnnaDownloadHandler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        book_storage,
+        "AA_BASE_URL",
+        f"http://127.0.0.1:{server.server_port}",
+    )
+    runtime_key = _runtime_secret()
+    md5 = "e" * 32
+    checks = iter((True, False))
+    try:
+        path, error = book_storage._download_from_aa(
+            str(tmp_path),
+            md5,
+            "pdf",
+            runtime_key,
+            aa_key_pool.key_id(runtime_key),
+            publish_guard=lambda: next(checks),
+        )
+        assert path is None
+        assert "发布期间已过期" in error
+        assert book_storage._find_local(str(tmp_path), md5) is None
+        assert list(tmp_path.glob(f"{md5}.pdf.part.*")) == []
+        assert not (tmp_path / f"{md5}.pdf").exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_expired_attempt_does_not_remove_newer_published_cache(
+    monkeypatch, tmp_path
+):
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        _FakeAnnaDownloadHandler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        book_storage,
+        "AA_BASE_URL",
+        f"http://127.0.0.1:{server.server_port}",
+    )
+    runtime_key = _runtime_secret()
+    md5 = "1" * 32
+    local_path = tmp_path / f"{md5}.pdf"
+    checks = {"count": 0}
+
+    def publish_guard():
+        checks["count"] += 1
+        if checks["count"] == 1:
+            return True
+        newer_path = tmp_path / "newer-attempt.pdf"
+        newer_path.write_bytes(b"newer-attempt-content")
+        os.replace(newer_path, local_path)
+        return False
+
+    try:
+        path, error = book_storage._download_from_aa(
+            str(tmp_path),
+            md5,
+            "pdf",
+            runtime_key,
+            aa_key_pool.key_id(runtime_key),
+            publish_guard=publish_guard,
+        )
+        assert path is None
+        assert "发布期间已过期" in error
+        assert local_path.read_bytes() == b"newer-attempt-content"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_unknown_403_is_transient_and_does_not_disable_account(
     monkeypatch, tmp_path, account_pool
 ):
@@ -679,6 +867,41 @@ def test_unknown_403_is_transient_and_does_not_disable_account(
         assert path is None
         assert "HTTP 403" in error
         assert state["status"] == "active"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_explicit_membership_403_disables_account(
+    monkeypatch, tmp_path, account_pool
+):
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        _FakeAnnaMembershipExpiredHandler,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(
+        book_storage,
+        "AA_BASE_URL",
+        f"http://127.0.0.1:{server.server_port}",
+    )
+    first, _ = account_pool
+    kid = aa_key_pool.key_id(first)
+    try:
+        with pytest.raises(book_storage.AAVipExpiredError):
+            book_storage._download_from_aa_pool(
+                str(tmp_path),
+                "f" * 32,
+                "pdf",
+                [(kid, first)],
+            )
+        state = next(
+            item for item in aa_key_pool.list_keys()
+            if item["id"] == kid
+        )
+        assert state["status"] == "disabled"
     finally:
         server.shutdown()
         server.server_close()
