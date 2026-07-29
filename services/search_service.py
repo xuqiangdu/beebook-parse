@@ -9,6 +9,7 @@ import re
 import time
 import logging
 import threading
+import html as html_lib
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -34,6 +35,11 @@ _mirrors_lock = threading.Lock()
 _alive_mirrors: list[str] = []
 _consecutive_fails = 0          # 连续失败计数
 _refresh_in_progress = False    # 去抖：避免多个并发失败同时触发多次 refresh
+
+_SEARCH_EXTENSIONS = frozenset({
+    "azw3", "cbr", "cbz", "djvu", "docx",
+    "epub", "fb2", "mobi", "pdf", "txt",
+})
 
 
 def _probe_mirror(base: str, timeout: int) -> tuple[str, float | None]:
@@ -232,16 +238,30 @@ def search_books(
         logger.info(f"降级命中备胎 {used_mirror}（主 {primary} 失败），后台重新选主")
         _trigger_refresh_async()
 
+    fallback_language = _single_requested_language(lang)
+    fallback_extension = _single_requested_extension(ext)
+
     # 先用 BeautifulSoup 解析，失败时降级到正则
     try:
         result = _parse_with_bs4(html)
         if result["results"]:
+            _apply_requested_fallbacks(
+                result["results"],
+                fallback_language,
+                fallback_extension,
+            )
             return result
         logger.warning("BS4 解析无结果，降级到正则")
     except Exception as e:
         logger.warning(f"BS4 解析异常，降级到正则: {e}")
 
-    return _parse_with_regex(html)
+    result = _parse_with_regex(html)
+    _apply_requested_fallbacks(
+        result["results"],
+        fallback_language,
+        fallback_extension,
+    )
+    return result
 
 
 def _parse_with_bs4(html: str) -> dict:
@@ -305,7 +325,7 @@ def _parse_with_bs4(html: str) -> dict:
             # 元信息 div 的特征：有 font-semibold 且 text-gray 类
             if "font-semibold" in classes and any("gray" in c for c in classes):
                 # 用 " ".join(d.stripped_strings) 避免子元素嵌套内容串在一起
-                t = " ".join(d.find_all(text=True, recursive=False)).strip()
+                t = " ".join(d.find_all(string=True, recursive=False)).strip()
                 # 如果只取直接文本不够，再取完整（但排除嵌套 div）
                 if not t or "·" not in t:
                     # 复制一份，移除嵌套的 div 再取 text
@@ -314,7 +334,7 @@ def _parse_with_bs4(html: str) -> dict:
                     for sub in d_copy.find_all("div"):
                         sub.decompose()
                     t = d_copy.get_text(strip=True)
-                if "·" in t and re.search(r"\[\w{2,3}\]", t):
+                if _looks_like_meta_text(t):
                     candidates.append(t)
 
         # 选最短的（最接近纯元信息）
@@ -325,7 +345,7 @@ def _parse_with_bs4(html: str) -> dict:
         if not meta_text:
             for d in card.find_all("div"):
                 t = d.get_text(strip=True)
-                if "·" in t and re.search(r"\[\w{2,3}\]", t) and len(t) < 250:
+                if _looks_like_meta_text(t) and len(t) < 250:
                     meta_text = t
                     break
 
@@ -365,21 +385,22 @@ def _parse_meta(text: str) -> dict:
     }
 
     # 语言 "中文 [zh]" / "English [en]" / "繁体中文 [zh-Hant]"
-    # 放宽到 [\w-]{2,8} 以兼容 BCP-47 子标签 (zh-Hant / pt-BR / sr-Latn 等)
-    lang_matches = re.findall(r"(\S+)\s*\[([\w-]{2,8})\]", text)
+    # 原始 HTML 可能包含 Tailwind/CSS 的 [7pt]/[9px]，必须先校验语言码。
+    lang_matches = []
+    seen_codes = set()
+    for name, raw_code in re.findall(r"(\S+)\s*\[([^\[\]]+)\]", text):
+        code = _normalize_language_code(raw_code)
+        if not code or code in seen_codes:
+            continue
+        seen_codes.add(code)
+        lang_matches.append((name, code))
     if lang_matches:
         info["language_names"] = [name for name, _ in lang_matches]
         info["languages"] = [code for _, code in lang_matches]
         info["language_name"] = lang_matches[0][0]
         info["language"] = lang_matches[0][1]
 
-    # 格式（大写或小写 .ext）
-    for part in text.split("·"):
-        p = part.strip()
-        # PDF / EPUB 这种纯大小写格式
-        if re.fullmatch(r"[A-Z]{2,5}", p) or re.fullmatch(r"[a-z]{2,5}", p):
-            info["extension"] = p.lower()
-            break
+    info["extension"] = _extract_extension(text)
 
     # 文件大小
     size_match = re.search(r"([\d.]+\s*[KMGT]B)", text)
@@ -397,6 +418,92 @@ def _parse_meta(text: str) -> dict:
         info["sources"] = [s for s in source_match.group(1).split("/") if s]
 
     return info
+
+
+def _normalize_language_code(value: str) -> str:
+    """Accept the language subset used by Anna and reject CSS bracket values."""
+    parts = str(value or "").strip().replace("_", "-").split("-")
+    if not re.fullmatch(
+        r"[A-Za-z]{2,3}(?:-(?:[A-Za-z]{2,8}|\d{3}))*",
+        "-".join(parts),
+    ):
+        return ""
+    normalized = [parts[0].lower()]
+    for part in parts[1:]:
+        if len(part) == 4:
+            normalized.append(part.title())
+        elif len(part) == 2 or part.isdigit():
+            normalized.append(part.upper())
+        else:
+            normalized.append(part.lower())
+    return "-".join(normalized)
+
+
+def _extract_extension(text: str) -> str:
+    for part in re.split(r"[·•]", text):
+        candidate = part.strip().lower().lstrip(".")
+        if candidate in _SEARCH_EXTENSIONS:
+            return candidate
+    extensions = "|".join(
+        re.escape(item)
+        for item in sorted(_SEARCH_EXTENSIONS, key=len, reverse=True)
+    )
+    match = re.search(
+        rf"(?<![A-Za-z0-9])({extensions})(?=\s*(?:[·•]|$))",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).lower()
+    return ""
+
+
+def _looks_like_meta_text(text: str) -> bool:
+    if "·" not in text and "•" not in text:
+        return False
+    language_codes = re.findall(r"\[([^\[\]]+)\]", text)
+    return bool(
+        _extract_extension(text)
+        or re.search(r"[\d.]+\s*[KMGT]B", text, re.IGNORECASE)
+        or any(_normalize_language_code(code) for code in language_codes)
+    )
+
+
+def _request_values(value: str | list[str]) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    return [item for item in value if str(item).strip()]
+
+
+def _single_requested_language(value: str | list[str]) -> str:
+    languages = {
+        code
+        for item in _request_values(value)
+        if (code := _normalize_language_code(item))
+    }
+    return next(iter(languages)) if len(languages) == 1 else ""
+
+
+def _single_requested_extension(value: str | list[str]) -> str:
+    extensions = {
+        str(item).strip().lower().lstrip(".")
+        for item in _request_values(value)
+        if str(item).strip().lower().lstrip(".") in _SEARCH_EXTENSIONS
+    }
+    return next(iter(extensions)) if len(extensions) == 1 else ""
+
+
+def _apply_requested_fallbacks(
+    results: list[dict],
+    fallback_language: str,
+    fallback_extension: str,
+) -> None:
+    for info in results:
+        if not info.get("languages") and fallback_language:
+            info["language"] = fallback_language
+            info["languages"] = [fallback_language]
+        if not info.get("extension") and fallback_extension:
+            info["extension"] = fallback_extension
 
 
 def _extract_total(html: str) -> int:
@@ -433,11 +540,16 @@ def _parse_with_regex(html: str) -> dict:
         chunk = block[:3000]
         contents = re.findall(r'data-content="([^"]*)"', chunk)
 
-        ext_match = re.search(r"·\s*([A-Z]{2,5})\s*·", chunk)
-        size_match = re.search(r"([\d.]+\s*[KMGT]B)", chunk)
-        # 和 _parse_meta 保持一致:全部语言都抓,放宽到 BCP-47 子标签
-        lang_codes = re.findall(r"\[([\w-]{2,8})\]", chunk)
         cover_match = re.search(r'<img[^>]*\bsrc="([^"]+)"', chunk)
+        visible = re.sub(
+            r"<(?:style|script)\b[^>]*>.*?</(?:style|script)>",
+            " ",
+            chunk,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        visible = html_lib.unescape(re.sub(r"<[^>]+>", " ", visible))
+        visible = re.sub(r"\s+", " ", visible)
+        meta_info = _parse_meta(visible)
 
         results.append({
             "md5": md5,
@@ -445,10 +557,7 @@ def _parse_with_regex(html: str) -> dict:
             "author": contents[1] if len(contents) > 1 else "",
             "publisher": contents[2] if len(contents) > 2 else "",
             "cover_url": cover_match.group(1) if cover_match else "",
-            "extension": ext_match.group(1).lower() if ext_match else "",
-            "filesize_str": size_match.group(1).replace(" ", "") if size_match else "",
-            "language": lang_codes[0] if lang_codes else "",
-            "languages": lang_codes,
+            **meta_info,
             "detail_url": f"{AA_BASE_URL}/md5/{md5}",
         })
 
