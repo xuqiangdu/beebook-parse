@@ -19,13 +19,11 @@ from api.aa_keys import aa_keys_bp
 from api.parse import parse_bp
 from services import aa_key_pool, book_storage
 from services.redis_store import (
-    get_control_redis,
     get_redis,
     get_parse_meta,
     store_parse_error,
     store_parse_pending,
     store_parse_result,
-    validate_control_redis,
 )
 from services.task_manager import (
     _COUNTER_KEYS,
@@ -50,16 +48,7 @@ def redis_client():
 
 
 @pytest.fixture
-def control_redis_client():
-    r = get_control_redis()
-    r.ping()
-    r.flushdb()
-    yield r
-    r.flushdb()
-
-
-@pytest.fixture
-def account_pool(monkeypatch, redis_client, control_redis_client):
+def account_pool(monkeypatch, redis_client):
     first = _runtime_secret()
     second = _runtime_secret()
     monkeypatch.setattr(config, "AA_SECRET_KEY", "")
@@ -71,7 +60,7 @@ def account_pool(monkeypatch, redis_client, control_redis_client):
 
 
 def test_rotation_is_atomic_and_redis_contains_no_raw_keys(
-    account_pool, redis_client, control_redis_client
+    account_pool, redis_client
 ):
     first, second = account_pool
 
@@ -83,16 +72,15 @@ def test_rotation_is_atomic_and_redis_contains_no_raw_keys(
     assert one[0][0] != two[0][0]
 
     serialized_state = []
-    for client in (redis_client, control_redis_client):
-        for key in client.scan_iter("aa:*"):
-            serialized_state.append(key)
-            key_type = client.type(key)
-            if key_type == "string":
-                serialized_state.append(client.get(key) or "")
-            elif key_type == "set":
-                serialized_state.extend(client.smembers(key))
-            elif key_type == "hash":
-                serialized_state.extend(client.hgetall(key).values())
+    for key in redis_client.scan_iter("aa:*"):
+        serialized_state.append(key)
+        key_type = redis_client.type(key)
+        if key_type == "string":
+            serialized_state.append(redis_client.get(key) or "")
+        elif key_type == "set":
+            serialized_state.extend(redis_client.smembers(key))
+        elif key_type == "hash":
+            serialized_state.extend(redis_client.hgetall(key).values())
     combined = "\n".join(serialized_state)
     assert first not in combined
     assert second not in combined
@@ -175,12 +163,12 @@ def test_transient_error_is_not_misclassified_as_pool_business_code(
 
 
 def test_cooldown_probe_has_single_lease_and_success_reactivates(
-    account_pool, control_redis_client
+    account_pool, redis_client
 ):
     first, _ = account_pool
     kid = aa_key_pool.key_id(first)
     aa_key_pool.mark_quota_exhausted(first, "quota")
-    control_redis_client.hset(
+    redis_client.hset(
         aa_key_pool._state_key(kid),
         "next_probe_at",
         int(time.time()) - 1,
@@ -201,65 +189,12 @@ def test_cooldown_probe_has_single_lease_and_success_reactivates(
     assert state["last_success_at"] > 0
 
 
-def test_anna_download_hard_concurrency_is_two(
-    monkeypatch, control_redis_client
-):
-    monkeypatch.setattr(config, "AA_DOWNLOAD_SLOT_WAIT_SECONDS", 2)
-    control_redis_client.delete(aa_key_pool.DOWNLOAD_LEASES)
-    start = threading.Barrier(6)
-    errors = []
-    active = 0
-    maximum = 0
-    lock = threading.Lock()
-
-    def worker():
-        nonlocal active, maximum
-        try:
-            start.wait(timeout=2)
-            with aa_key_pool.anna_download_slot():
-                with lock:
-                    active += 1
-                    maximum = max(maximum, active)
-                time.sleep(0.08)
-                with lock:
-                    active -= 1
-        except Exception as exc:
-            errors.append(exc)
-
-    threads = [threading.Thread(target=worker) for _ in range(6)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=3)
-
-    assert not errors
-    assert maximum == 2
-    assert control_redis_client.zcard(aa_key_pool.DOWNLOAD_LEASES) == 0
-
-
-def test_anna_download_control_plane_failure_is_fail_closed(monkeypatch):
-    class UnavailableControlRedis:
-        def eval(self, *_args, **_kwargs):
-            raise ConnectionError("control redis unavailable")
-
-    monkeypatch.setattr(
-        aa_key_pool,
-        "get_control_redis",
-        lambda: UnavailableControlRedis(),
-    )
-    with pytest.raises(aa_key_pool.AnnaDownloadBusyError) as caught:
-        with aa_key_pool.anna_download_slot():
-            raise AssertionError("download must not start")
-
-    assert "control plane" in str(caught.value)
-
-
 def test_same_md5_content_lock_is_serialized(
-    monkeypatch, control_redis_client
+    monkeypatch, redis_client
 ):
-    monkeypatch.setattr(config, "AA_DOWNLOAD_SLOT_WAIT_SECONDS", 2)
+    monkeypatch.setattr(config, "CONTENT_LOCK_WAIT_SECONDS", 2)
     md5 = "a" * 32
-    control_redis_client.delete(
+    redis_client.delete(
         f"{aa_key_pool.CONTENT_LEASE_PREFIX}{md5}"
     )
     start = threading.Barrier(4)
@@ -290,33 +225,13 @@ def test_same_md5_content_lock_is_serialized(
 
     assert not errors
     assert maximum == 1
-    assert not control_redis_client.exists(
+    assert not redis_client.exists(
         f"{aa_key_pool.CONTENT_LEASE_PREFIX}{md5}"
     )
 
 
-def test_control_redis_requires_noeviction(
-    monkeypatch, control_redis_client
-):
-    assert validate_control_redis()["maxmemory_policy"] == "noeviction"
-
-    class EvictableControlRedis:
-        def ping(self):
-            return True
-
-        def config_get(self, _name):
-            return {"maxmemory-policy": "allkeys-lfu"}
-
-    monkeypatch.setattr(
-        "services.redis_store.get_control_redis",
-        lambda: EvictableControlRedis(),
-    )
-    with pytest.raises(RuntimeError, match="noeviction"):
-        validate_control_redis()
-
-
 def test_no_configured_accounts_is_10001(
-    monkeypatch, redis_client, control_redis_client
+    monkeypatch, redis_client
 ):
     monkeypatch.setattr(config, "AA_SECRET_KEY", "")
     monkeypatch.setattr(config, "AA_SECRET_KEYS", "")
@@ -328,7 +243,7 @@ def test_no_configured_accounts_is_10001(
     assert "未配置" in str(caught.value)
 
 
-def test_account_selection_happens_after_download_slot(monkeypatch):
+def test_account_selection_happens_inside_content_lock(monkeypatch):
     events = []
 
     @contextmanager
@@ -337,15 +252,8 @@ def test_account_selection_happens_after_download_slot(monkeypatch):
         yield
         events.append("content-exit")
 
-    @contextmanager
-    def download_slot():
-        events.append("slot-enter")
-        yield
-        events.append("slot-exit")
-
     monkeypatch.setattr(book_storage, "_find_local", lambda *_args: None)
     monkeypatch.setattr(book_storage, "anna_content_lock", content_lock)
-    monkeypatch.setattr(book_storage, "anna_download_slot", download_slot)
     monkeypatch.setattr(
         book_storage,
         "available_keys",
@@ -361,8 +269,8 @@ def test_account_selection_happens_after_download_slot(monkeypatch):
 
     assert path == "/tmp/book.pdf"
     assert error is None
-    assert events.index("slot-enter") < events.index("accounts")
-    assert events.index("accounts") < events.index("slot-exit")
+    assert events.index("content-enter") < events.index("accounts")
+    assert events.index("accounts") < events.index("content-exit")
 
 
 def test_total_inflight_backpressure_and_atomic_reservation(

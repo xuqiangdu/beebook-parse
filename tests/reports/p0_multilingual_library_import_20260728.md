@@ -11,7 +11,7 @@
 
 | OpenSpec | 结果 | 实现 |
 |---|---|---|
-| 8.1 | 通过 | Anna 下载由进程内信号量和可续期 Redis 全局租约双重限制，硬上限 2；控制面异常时 fail-closed |
+| 8.1 | 通过 | 按最终职责移除 parse 的 Anna 专用并发 2；导书并发由 AIBookServer 控制，parse 保留独立下载/解析池 |
 | 8.2 | 通过 | Redis `INCR` 原子轮转账号，冷却探测使用原子 probe lease |
 | 8.3 | 通过 | 仅持久化账号 ID、active/cooldown/disabled、last success/error、next probe |
 | 8.4 | 通过 | 单账号 quota 或 membership 失败后继续尝试下一账号 |
@@ -19,8 +19,8 @@
 | 8.6 | 通过 | 10001/10002 响应包含 `next_probe_at`、`retry_after_seconds` 和 `Retry-After` |
 | 8.7 | 通过 | 背压统计 queued + downloading + parsing，并用 Lua 原子预留总在途槽位 |
 | 8.8 | 通过 | task lock、meta、chunk 和 counter 使用 attempt generation fencing |
-| 8.9 | 通过 | 新增独立 noeviction control Redis；显式配置并启动校验；启动时删除旧 Redis 原始 Key 集合 |
-| 8.10 | 通过 | 覆盖多账号、混合错误、探测、并发、背压、fencing、半文件、过小占位内容、原子发布和本地假上游 |
+| 8.9 | 通过 | 账号状态、轮转、探测和同 MD5 锁使用原 Redis 独立前缀；启动时删除旧 Redis 原始 Key 集合 |
+| 8.10 | 通过 | 覆盖多账号、混合错误、探测、同 MD5 锁、背压、fencing、半文件、过小占位内容、原子发布和本地假上游 |
 | 8.11 | 通过 | 账号只从环境加载，删除运行时新增账号接口，增加只读脱敏健康接口 |
 
 ## 自动化测试
@@ -31,9 +31,6 @@
 REDIS_HOST=127.0.0.1 \
 REDIS_PORT=16380 \
 REDIS_DB=0 \
-CONTROL_REDIS_HOST=127.0.0.1 \
-CONTROL_REDIS_PORT=16381 \
-CONTROL_REDIS_DB=0 \
 WATCHDOG_INTERVAL_SEC=1 \
 AA_SECRET_KEY= \
 AA_SECRET_KEYS= \
@@ -43,14 +40,14 @@ AA_SECRET_KEYS= \
 结果：
 
 ```text
-37 passed in 46.79s
+34 passed in 11.75s
 ```
 
 覆盖：
 
 - 原有启动自愈、看门狗、缓存清理、内存保护、状态流转和 counter 测试。
 - 新增账号轮转、Redis 无原始 Key、quota/disabled 聚合、普通错误隔离、
-  冷却单探测、Anna 全局并发 2、control Redis fail-closed、同 MD5 串行、
+  冷却单探测、同 MD5 串行、
   总在途背压、attempt fencing、业务状态码、动态 Retry-After、脱敏健康接口、
   半包清理、过小占位内容拒绝、过期任务禁止发布、本地 HTTP quota/普通
   429 和日志脱敏测试。
@@ -97,7 +94,7 @@ docker compose --env-file /dev/null config --quiet: passed
 - `/api/admin/aa-keys/health` 和旧只读列表只返回脱敏 ID 与状态。
 - 已移除 `/api/admin/aa-keys/add`；新增账号必须修改忽略的 `.env` 或部署环境并重启。
 - 异常消息写 Redis/API 前执行运行时 Key 脱敏，日志只记录账号 ID。
-- control Redis 必须是 `noeviction`；配置错误或不可用时 Anna 下载不会降级放行。
+- 账号状态和内容锁使用原 Redis 的 `aa:control:*` 前缀，不再要求第二套 Redis。
 - 原书使用唯一临时文件写入，校验后原子发布；半文件和过期 attempt 不进入缓存。
 - 默认拒绝小于 32B 的占位/异常原文件，可通过 `MIN_BOOK_FILE_BYTES`
   调整。
@@ -105,7 +102,7 @@ docker compose --env-file /dev/null config --quiet: passed
 ## 运行方式
 
 1. 复制 `.env.example` 为被 Git 忽略的 `.env`。
-2. 在 `.env` 或部署环境中配置单账号或多账号环境变量。
+2. 在 `.env` 中只配置逗号分隔的 `AA_SECRET_KEYS`。
 3. 设置独立管理凭证后启动：
 
 ```bash

@@ -45,39 +45,6 @@ def get_redis() -> redis.Redis:
     )
 
 
-def get_control_redis() -> redis.Redis:
-    """Return the non-evictable Redis used by the Anna account control plane."""
-    if not config.CONTROL_REDIS_HOST:
-        raise RuntimeError("CONTROL_REDIS_HOST is required")
-    return redis.Redis(
-        host=config.CONTROL_REDIS_HOST,
-        port=config.CONTROL_REDIS_PORT,
-        db=config.CONTROL_REDIS_DB,
-        password=config.CONTROL_REDIS_PASSWORD,
-        decode_responses=True,
-    )
-
-
-def validate_control_redis() -> dict:
-    """Verify that Anna control state cannot be evicted."""
-    client = get_control_redis()
-    client.ping()
-    policy = (
-        client.config_get("maxmemory-policy").get("maxmemory-policy")
-        or ""
-    ).lower()
-    if policy != "noeviction":
-        raise RuntimeError(
-            "control Redis maxmemory-policy must be noeviction"
-        )
-    return {
-        "host": config.CONTROL_REDIS_HOST,
-        "port": config.CONTROL_REDIS_PORT,
-        "db": config.CONTROL_REDIS_DB,
-        "maxmemory_policy": policy,
-    }
-
-
 def _chunk_key(task_id: str, index: int, attempt_id: str | None = None) -> str:
     if attempt_id:
         return f"parse:{task_id}:attempt:{attempt_id}:chunk:{index}"

@@ -18,9 +18,8 @@ from collections.abc import Callable
 
 import config
 from services.aa_key_pool import (
-    AnnaDownloadBusyError,
+    AnnaContentBusyError,
     anna_content_lock,
-    anna_download_slot,
     available_keys,
     mark_disabled,
     mark_quota_exhausted,
@@ -104,37 +103,34 @@ def find_book_file(
             if path:
                 return path, None
 
-            with anna_download_slot():
-                # Select accounts only after a global download slot is held;
-                # otherwise a queued worker can retain a stale account state.
+            aa_keys = available_keys()
+            if not aa_keys:
+                seed_keys_from_env()
                 aa_keys = available_keys()
-                if not aa_keys:
-                    seed_keys_from_env()
-                    aa_keys = available_keys()
-                if not aa_keys:
-                    info = unavailable_info()
-                    if info["reason"] == "quota":
-                        raise AADownloadQuotaExceededError(
-                            "AA 账号当日下载额度用尽",
-                            next_probe_at=info["next_probe_at"],
-                            retry_after_seconds=info[
-                                "retry_after_seconds"
-                            ],
-                        )
-                    raise AAVipExpiredError(
-                        "AA 账号未配置、VIP 过期或无可用 key",
+            if not aa_keys:
+                info = unavailable_info()
+                if info["reason"] == "quota":
+                    raise AADownloadQuotaExceededError(
+                        "AA 账号当日下载额度用尽",
                         next_probe_at=info["next_probe_at"],
                         retry_after_seconds=info[
                             "retry_after_seconds"
                         ],
                     )
-                path, err = _download_from_aa_pool(
-                    books_dir,
-                    md5,
-                    extension,
-                    aa_keys,
-                    publish_guard=publish_guard,
+                raise AAVipExpiredError(
+                    "AA 账号未配置、VIP 过期或无可用 key",
+                    next_probe_at=info["next_probe_at"],
+                    retry_after_seconds=info[
+                        "retry_after_seconds"
+                    ],
                 )
+            path, err = _download_from_aa_pool(
+                books_dir,
+                md5,
+                extension,
+                aa_keys,
+                publish_guard=publish_guard,
+            )
             if path:
                 return path, None
             if err:
@@ -154,7 +150,7 @@ def find_book_file(
                     reasons.append(f"OSS: {err}")
             else:
                 reasons.append("OSS: 未配置 OSS_BASE_URL")
-    except AnnaDownloadBusyError as exc:
+    except AnnaContentBusyError as exc:
         raise AAUpstreamRateLimitedError(
             str(exc),
             retry_after_seconds=5,

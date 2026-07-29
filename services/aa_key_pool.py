@@ -12,7 +12,7 @@ from datetime import date, datetime
 import requests
 
 import config
-from services.redis_store import get_control_redis, get_redis
+from services.redis_store import get_redis
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,6 @@ KEY_STATE_PREFIX = "aa:control:key:"
 KEY_EXPIRY = "aa:control:key_expiry"
 ROTATION_KEY = "aa:control:rotation"
 PROBE_LEASE_PREFIX = "aa:control:probe:"
-DOWNLOAD_LEASES = "aa:control:download_leases"
 CONTENT_LEASE_PREFIX = "aa:control:content:"
 
 # Removed on startup because the legacy implementation stored raw keys here.
@@ -30,30 +29,10 @@ LEGACY_RAW_KEY_SET = "aa:keys"
 
 _secrets_lock = threading.Lock()
 _secret_by_id: dict[str, str] = {}
-_local_download_slots = threading.BoundedSemaphore(config.AA_DOWNLOAD_CONCURRENCY)
 
 _EXPIRY_RE = re.compile(
     r"会员[：:].*?(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*到期"
 )
-
-_ACQUIRE_DOWNLOAD_SLOT = """
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-if redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[2]) then
-  return 0
-end
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
-return 1
-"""
-
-_RENEW_DOWNLOAD_SLOT = """
-if redis.call('ZSCORE', KEYS[1], ARGV[1]) then
-  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
-  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
-  return 1
-end
-return 0
-"""
 
 _RENEW_STRING_LEASE = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -71,8 +50,8 @@ return 0
 """
 
 
-class AnnaDownloadBusyError(Exception):
-    """Anna download slots did not become available before the wait deadline."""
+class AnnaContentBusyError(Exception):
+    """Another worker held the same-content lock past the wait deadline."""
 
 
 def key_id(secret_key: str) -> str:
@@ -118,14 +97,8 @@ def seed_keys_from_env() -> int:
         _secret_by_id.clear()
         _secret_by_id.update(secrets)
 
-    r = get_control_redis()
+    r = get_redis()
     previous = set(r.smembers(KEY_IDS))
-    # Purge the legacy raw-key set from both the old result Redis and the
-    # control Redis without ever reading or logging its values.
-    try:
-        get_redis().delete(LEGACY_RAW_KEY_SET)
-    except Exception:
-        logger.warning("Failed to purge legacy AA key storage")
     pipe = r.pipeline()
     pipe.delete(LEGACY_RAW_KEY_SET)
     pipe.delete(KEY_IDS)
@@ -172,7 +145,7 @@ def _state_for(r, kid: str) -> dict:
 def list_keys() -> list[dict]:
     """Return redacted account state. Raw keys never leave process memory."""
     secrets = _ensure_loaded()
-    r = get_control_redis()
+    r = get_redis()
     now = int(time.time())
     expiry_map = r.hgetall(KEY_EXPIRY)
     items: list[dict] = []
@@ -205,7 +178,6 @@ def pool_health(include_accounts: bool = True) -> dict:
         "active": sum(item["status"] == "active" for item in items),
         "cooldown": sum(item["status"] == "cooldown" for item in items),
         "disabled": sum(item["status"] == "disabled" for item in items),
-        "download_concurrency_limit": config.AA_DOWNLOAD_CONCURRENCY,
     }
     probes = [
         item["next_probe_at"] for item in items
@@ -235,7 +207,7 @@ def available_keys() -> list[tuple[str, str]]:
     if not secrets:
         return []
 
-    r = get_control_redis()
+    r = get_redis()
     now = int(time.time())
     result: list[tuple[str, str]] = []
     for kid in _rotated_ids(r, sorted(secrets)):
@@ -299,7 +271,7 @@ def unavailable_status() -> str | None:
 def mark_success(secret_key: str) -> None:
     kid = key_id(secret_key)
     now = int(time.time())
-    r = get_control_redis()
+    r = get_redis()
     r.hset(_state_key(kid), mapping={
         "status": "active",
         "last_success_at": now,
@@ -310,7 +282,7 @@ def mark_success(secret_key: str) -> None:
 
 def mark_transient_error(secret_key: str, reason: str) -> None:
     kid = key_id(secret_key)
-    get_control_redis().hset(_state_key(kid), mapping={
+    get_redis().hset(_state_key(kid), mapping={
         "last_error_at": int(time.time()),
         "last_error": _safe_reason(reason),
     })
@@ -320,7 +292,7 @@ def mark_quota_exhausted(secret_key: str, reason: str) -> None:
     kid = key_id(secret_key)
     now = int(time.time())
     next_probe_at = now + max(config.AA_KEY_COOLDOWN_SECONDS, 60)
-    r = get_control_redis()
+    r = get_redis()
     r.hset(_state_key(kid), mapping={
         "status": "cooldown",
         "quota_exhausted_at": now,
@@ -337,7 +309,7 @@ def mark_disabled(secret_key: str, reason: str) -> None:
     kid = key_id(secret_key)
     now = int(time.time())
     next_probe_at = now + max(config.AA_KEY_DISABLED_PROBE_SECONDS, 60)
-    r = get_control_redis()
+    r = get_redis()
     r.hset(_state_key(kid), mapping={
         "status": "disabled",
         "disabled_at": now,
@@ -351,121 +323,37 @@ def mark_disabled(secret_key: str, reason: str) -> None:
 
 
 @contextmanager
-def anna_download_slot():
-    """Enforce the Anna fast-download concurrency limit locally and in Redis."""
-    local_acquired = _local_download_slots.acquire(
-        timeout=config.AA_DOWNLOAD_SLOT_WAIT_SECONDS
-    )
-    if not local_acquired:
-        raise AnnaDownloadBusyError("Anna download slots are busy")
-
-    token = uuid.uuid4().hex
-    control = None
-    distributed_acquired = False
-    heartbeat_stop = threading.Event()
-    heartbeat_thread = None
-    deadline = time.monotonic() + config.AA_DOWNLOAD_SLOT_WAIT_SECONDS
-    try:
-        while time.monotonic() < deadline:
-            now_ms = int(time.time() * 1000)
-            lease_until_ms = now_ms + config.AA_DOWNLOAD_LEASE_SECONDS * 1000
-            try:
-                control = get_control_redis()
-                distributed_acquired = bool(control.eval(
-                    _ACQUIRE_DOWNLOAD_SLOT,
-                    1,
-                    DOWNLOAD_LEASES,
-                    now_ms,
-                    config.AA_DOWNLOAD_CONCURRENCY,
-                    lease_until_ms,
-                    token,
-                    config.AA_DOWNLOAD_LEASE_SECONDS,
-                ))
-            except Exception as exc:
-                raise AnnaDownloadBusyError(
-                    "Anna download control plane is unavailable"
-                ) from exc
-            if distributed_acquired:
-                break
-            time.sleep(0.05)
-
-        if not distributed_acquired:
-            raise AnnaDownloadBusyError("Anna download slots are busy")
-        heartbeat_thread = threading.Thread(
-            target=_renew_download_slot,
-            args=(control, token, heartbeat_stop),
-            daemon=True,
-        )
-        heartbeat_thread.start()
-        yield
-    finally:
-        heartbeat_stop.set()
-        if heartbeat_thread is not None:
-            heartbeat_thread.join(timeout=1)
-        if distributed_acquired and control is not None:
-            try:
-                control.zrem(DOWNLOAD_LEASES, token)
-            except Exception:
-                logger.warning("Failed to release Anna download lease")
-        _local_download_slots.release()
-
-
-def _renew_download_slot(control, token: str,
-                         stop: threading.Event) -> None:
-    interval = max(min(config.AA_DOWNLOAD_LEASE_SECONDS // 3, 30), 1)
-    while not stop.wait(interval):
-        try:
-            now_ms = int(time.time() * 1000)
-            renewed = control.eval(
-                _RENEW_DOWNLOAD_SLOT,
-                1,
-                DOWNLOAD_LEASES,
-                token,
-                now_ms + config.AA_DOWNLOAD_LEASE_SECONDS * 1000,
-                config.AA_DOWNLOAD_LEASE_SECONDS,
-            )
-            if not renewed:
-                logger.error("AA download lease disappeared before release")
-                return
-        except Exception as exc:
-            logger.error(
-                "AA download lease renewal failed: %s",
-                type(exc).__name__,
-            )
-
-
-@contextmanager
 def anna_content_lock(md5: str):
     """Serialize publication of one cached source file across all workers."""
     token = uuid.uuid4().hex
     lease_key = f"{CONTENT_LEASE_PREFIX}{md5.lower().strip()}"
-    deadline = time.monotonic() + config.AA_DOWNLOAD_SLOT_WAIT_SECONDS
-    control = None
+    deadline = time.monotonic() + config.CONTENT_LOCK_WAIT_SECONDS
+    client = None
     acquired = False
     heartbeat_stop = threading.Event()
     heartbeat_thread = None
     try:
         while time.monotonic() < deadline:
             try:
-                control = get_control_redis()
-                acquired = bool(control.set(
+                client = get_redis()
+                acquired = bool(client.set(
                     lease_key,
                     token,
                     nx=True,
-                    ex=config.AA_DOWNLOAD_LEASE_SECONDS,
+                    ex=config.CONTENT_LOCK_LEASE_SECONDS,
                 ))
             except Exception as exc:
-                raise AnnaDownloadBusyError(
-                    "Anna content lock control plane is unavailable"
+                raise AnnaContentBusyError(
+                    "Anna content lock Redis is unavailable"
                 ) from exc
             if acquired:
                 break
             time.sleep(0.05)
         if not acquired:
-            raise AnnaDownloadBusyError("Anna content is already downloading")
+            raise AnnaContentBusyError("Anna content is already downloading")
         heartbeat_thread = threading.Thread(
             target=_renew_string_lease,
-            args=(control, lease_key, token, heartbeat_stop),
+            args=(client, lease_key, token, heartbeat_stop),
             daemon=True,
         )
         heartbeat_thread.start()
@@ -474,9 +362,9 @@ def anna_content_lock(md5: str):
         heartbeat_stop.set()
         if heartbeat_thread is not None:
             heartbeat_thread.join(timeout=1)
-        if acquired and control is not None:
+        if acquired and client is not None:
             try:
-                control.eval(
+                client.eval(
                     _RELEASE_STRING_LEASE,
                     1,
                     lease_key,
@@ -486,17 +374,17 @@ def anna_content_lock(md5: str):
                 logger.warning("Failed to release Anna content lease")
 
 
-def _renew_string_lease(control, lease_key: str, token: str,
+def _renew_string_lease(client, lease_key: str, token: str,
                         stop: threading.Event) -> None:
-    interval = max(min(config.AA_DOWNLOAD_LEASE_SECONDS // 3, 30), 1)
+    interval = max(min(config.CONTENT_LOCK_LEASE_SECONDS // 3, 30), 1)
     while not stop.wait(interval):
         try:
-            renewed = control.eval(
+            renewed = client.eval(
                 _RENEW_STRING_LEASE,
                 1,
                 lease_key,
                 token,
-                config.AA_DOWNLOAD_LEASE_SECONDS,
+                config.CONTENT_LOCK_LEASE_SECONDS,
             )
             if not renewed:
                 logger.error("AA content lease disappeared before release")
@@ -556,7 +444,7 @@ def _fetch_expiry_from_aa(secret_key: str) -> int | None:
 
 
 def get_key_expiry(secret_key: str, force: bool = False) -> dict:
-    r = get_control_redis()
+    r = get_redis()
     kid = key_id(secret_key)
     cached = _to_ts(r.hget(KEY_EXPIRY, kid))
     cached_days = _days_until(cached)

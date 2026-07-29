@@ -54,8 +54,6 @@ app.register_blueprint(search_bp)
 def _bootstrap():
     """启动时的一次性动作:清僵尸 + 起后台看门狗"""
     try:
-        from services.redis_store import validate_control_redis
-        validate_control_redis()
         imported = seed_keys_from_env()
         logging.getLogger(__name__).info("AA key 池初始化完成: 新增 %s 个 env key", imported)
     except Exception:
@@ -84,19 +82,11 @@ _bootstrap()
 @app.route("/health", methods=["GET"])
 def health():
     redis_ok = False
-    control_redis_ok = False
     try:
         from services.redis_store import get_redis
         r = get_redis()
         r.ping()
         redis_ok = True
-    except Exception:
-        pass
-
-    try:
-        from services.redis_store import get_control_redis
-        get_control_redis().ping()
-        control_redis_ok = True
     except Exception:
         pass
 
@@ -111,13 +101,11 @@ def health():
             "cooldown": 0,
             "disabled": 0,
             "next_probe_at": 0,
-            "download_concurrency_limit": config.AA_DOWNLOAD_CONCURRENCY,
         }
 
     return api_ok({
-        "status": "ok" if redis_ok and control_redis_ok else "degraded",
+        "status": "ok" if redis_ok else "degraded",
         "redis": "connected" if redis_ok else "disconnected",
-        "control_redis": "connected" if control_redis_ok else "disconnected",
         "search_source": config.AA_BASE_URL,
         "download_api": (
             "fast_download_pool" if aa_pool["configured"] else "未配置"

@@ -6,14 +6,6 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 
-# Redis for non-evictable Anna account-pool control state.
-# It must be explicitly configured so production cannot silently fall back to
-# an evictable result-cache Redis.
-CONTROL_REDIS_HOST = os.getenv("CONTROL_REDIS_HOST", "").strip()
-CONTROL_REDIS_PORT = int(os.getenv("CONTROL_REDIS_PORT", REDIS_PORT))
-CONTROL_REDIS_DB = int(os.getenv("CONTROL_REDIS_DB", 0))
-CONTROL_REDIS_PASSWORD = os.getenv("CONTROL_REDIS_PASSWORD", REDIS_PASSWORD)
-
 # Redis 大 Key 拆分阈值（512KB）
 REDIS_CHUNK_SIZE = int(os.getenv("REDIS_CHUNK_SIZE", 512 * 1024))
 # 解析结果缓存过期时间（秒）- 默认 3 小时
@@ -37,20 +29,6 @@ PARSE_LARGE_CONCURRENCY = int(os.getenv("PARSE_LARGE_CONCURRENCY", 6))
 
 # 下载并发池(独立于解析,避免下载慢拖累解析)
 DOWNLOAD_CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", 6))
-
-# Hard Anna fast-download limit; an environment override cannot exceed two.
-AA_DOWNLOAD_CONCURRENCY = min(
-    max(int(os.getenv("AA_DOWNLOAD_CONCURRENCY", 2)), 1),
-    2,
-)
-AA_DOWNLOAD_LEASE_SECONDS = max(
-    int(os.getenv("AA_DOWNLOAD_LEASE_SECONDS", 600)),
-    int(os.getenv("TASK_TIMEOUT_SEC", 300)) + 360,
-)
-AA_DOWNLOAD_SLOT_WAIT_SECONDS = min(
-    max(int(os.getenv("AA_DOWNLOAD_SLOT_WAIT_SECONDS", 30)), 1),
-    max(int(os.getenv("TASK_TIMEOUT_SEC", 300)) - 5, 1),
-)
 
 # 大小文件分界(MB)
 LARGE_FILE_THRESHOLD_MB = int(os.getenv("LARGE_FILE_THRESHOLD_MB", 20))
@@ -78,6 +56,11 @@ MEM_CRITICAL_WATERMARK = float(os.getenv("MEM_CRITICAL_WATERMARK", "0.95"))
 # ─────────────── 看门狗(v2)────────────────
 # 单任务超时(秒)。超过这个时间被强制标 failed (code=504)
 TASK_TIMEOUT_SEC = int(os.getenv("TASK_TIMEOUT_SEC", 300))
+
+# Same-content publication lock. Import concurrency is controlled by
+# AIBookServer; this lock only prevents duplicate downloads for one MD5.
+CONTENT_LOCK_WAIT_SECONDS = 30
+CONTENT_LOCK_LEASE_SECONDS = max(TASK_TIMEOUT_SEC + 360, 600)
 
 # 看门狗扫描频率(秒)
 WATCHDOG_INTERVAL_SEC = int(os.getenv("WATCHDOG_INTERVAL_SEC", 30))

@@ -19,23 +19,6 @@ services:
       timeout: 3s
       retries: 5
 
-  redis-control:
-    image: redis:7-alpine
-    container_name: beebook-redis-control
-    restart: unless-stopped
-    command: >
-      redis-server
-      --appendonly yes
-      --appendfsync everysec
-      --maxmemory-policy noeviction
-    volumes:
-      - redis-control-data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-
   app:
     image: anciea/beebook-app:latest
     pull_policy: always
@@ -48,13 +31,10 @@ services:
         required: false
     environment:
       - REDIS_HOST=redis
-      - CONTROL_REDIS_HOST=redis-control
       - AA_BASE_URL=https://zh.annas-archive.gl
       - AA_SECRET_KEY=${AA_SECRET_KEY:-}
       - AA_SECRET_KEYS=${AA_SECRET_KEYS:-}
       - AA_KEY_ADMIN_SECRET=${AA_KEY_ADMIN_SECRET:-}
-      - AA_DOWNLOAD_CONCURRENCY=2
-      - AA_KEY_COOLDOWN_SECONDS=${AA_KEY_COOLDOWN_SECONDS:-1800}
       - OSS_BASE_URL=${OSS_BASE_URL:-}
       # ⭐v2 并发配置(注释行为 4C8G 默认值,解开按需覆盖)
       # - PARSE_SMALL_CONCURRENCY=16
@@ -77,8 +57,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      redis-control:
-        condition: service_healthy
     # ⭐v2 4C8G 资源限制(给 Redis 留 1G,系统留 ~1G)
     deploy:
       resources:
@@ -88,4 +66,3 @@ services:
 
 volumes:
   redis-data:
-  redis-control-data:
