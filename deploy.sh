@@ -1,20 +1,17 @@
 #!/usr/bin/env bash
-# 在目标机器上运行:拉最新镜像 + 重启 app 服务 + 清理悬挂镜像
+# Run on the target host: pull the image and recreate only the app service.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-echo "==> [1/4] Pull latest image from Docker Hub..."
-docker compose pull app
+echo "==> [1/3] Pull latest image from Docker Hub..."
+docker compose -f docker-compose.yml pull app
 
-echo "==> [2/4] Recreate app container with new image..."
-docker compose up -d app
+echo "==> [2/3] Recreate app container only..."
+docker compose -f docker-compose.yml up -d --no-deps app
 
-echo "==> [3/4] Prune dangling images..."
-docker image prune -f
-
-echo "==> [4/4] Current status:"
-docker compose ps
+echo "==> [3/3] Current status:"
+docker compose -f docker-compose.yml ps
 
 echo "==> Deploy done. Tailing last 20 lines of app logs:"
-docker compose logs --tail=20 app
+docker compose -f docker-compose.yml logs --tail=20 app

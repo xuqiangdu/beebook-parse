@@ -5,7 +5,8 @@ WORKDIR /app
 # 系统依赖：
 #   poppler-utils —— pdftotext 二进制（PDF 备用解析引擎）
 #   libmagic1     —— python-magic 的依赖（/api/parse 做 MIME 检测时用）
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         poppler-utils libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 

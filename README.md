@@ -80,6 +80,20 @@ curl -X POST http://localhost:5555/api/parse \
 curl http://localhost:5555/api/parse/e1a448749dbc9402584da3c64a6eeac9_default
 ```
 
+### 测试服务器本地直发
+
+不依赖 GitHub Actions 或 Docker Hub，在本机完成 `linux/amd64` 构建后通过
+SSH 传输镜像，并只重建远端 `beebook-app`：
+
+```bash
+./deploy-remote.sh
+```
+
+脚本固定发布到 `ubuntu@13.229.64.143:/home/ubuntu/beebook-parse`，不会执行
+`docker compose down`、不会重启 `beebook-redis`、不会清理全局镜像。发布前后
+会核对所有非目标容器，健康检查失败时自动恢复上一个 `beebook-app` 镜像。
+Anna Key 仍只维护在远端未跟踪的 `.env`，不会进入构建上下文或镜像。
+
 ## API
 
 ### 搜索
