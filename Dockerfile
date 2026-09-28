@@ -14,6 +14,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
 RUN playwright install --with-deps chromium
 
+# Xvfb readiness signaling requires its parent to run outside PID 1.
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
 ENV AA_BROWSER_ENABLED=true
 
 COPY . .

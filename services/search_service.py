@@ -42,7 +42,7 @@ _SEARCH_EXTENSIONS = frozenset({
 })
 
 
-def _probe_mirror(base: str, timeout: int) -> tuple[str, float | None]:
+def _probe_mirror(base: str, timeout: int, session=None) -> tuple[str, float | None]:
     """
     探测单个镜像。通过两个判据才算"真可用"：
       1. HTTP 200
@@ -52,15 +52,40 @@ def _probe_mirror(base: str, timeout: int) -> tuple[str, float | None]:
     """
     try:
         t0 = time.time()
-        r = _session.get(f"{base}/search",
+        r = (session or _session).get(f"{base}/search",
                          params={"q": "中国"},  # 用常见中文词，保证能命中内容
                          timeout=timeout)
         dt = (time.time() - t0) * 1000
         if r.status_code == 200 and "js-aarecord-list-outer" in r.text:
             return base, dt
     except Exception as e:
-        logger.debug(f"镜像探测失败 {base}: {e}")
+        logger.debug("镜像探测失败 %s: %s", base, type(e).__name__)
     return base, None
+
+
+def _refresh_member_session(base: str) -> float | None:
+    """Validate configured members without changing download pool state."""
+    keys = dict.fromkeys(
+        key.strip() for key in [config.AA_SECRET_KEY, *config.AA_SECRET_KEYS.split(",")]
+        if key.strip()
+    )
+    for key in keys:
+        try:
+            with requests.Session() as session:
+                session.headers.update(_session.headers)
+                response = session.post(
+                    f"{base}/account/", data={"key": key},
+                    timeout=config.AA_REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                _, latency = _probe_mirror(base, config.AA_REQUEST_TIMEOUT, session)
+                if latency is not None:
+                    # A login response alone does not prove active membership.
+                    _session.cookies.update(session.cookies)
+                    return latency
+        except Exception as e:
+            logger.warning("会员搜索会话验证失败: %s", type(e).__name__)
+    return None
 
 
 def _refresh_browser_session(base: str):
@@ -122,6 +147,12 @@ def _probe_all_mirrors() -> list[str]:
                 logger.info(f"  ✓ {base:<40} {latency:.0f}ms")
             else:
                 logger.info(f"  ✗ {base:<40} 不可用")
+
+    if not alive:
+        latency = _refresh_member_session(config.AA_BASE_URL)
+        if latency is not None:
+            alive.append((config.AA_BASE_URL, latency))
+            logger.info("会员会话验证成功，HTTP 搜索已恢复")
 
     if not alive and config.AA_BROWSER_ENABLED:
         try:
