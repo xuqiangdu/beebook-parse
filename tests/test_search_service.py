@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from unittest.mock import Mock, call
 
 import pytest
 import requests
@@ -25,6 +26,7 @@ def search_service():
         "AA_BASE_URL",
         "https://anna-search.invalid",
     )
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", False)
     monkeypatch.setattr(
         requests.Session,
         "get",
@@ -201,3 +203,122 @@ def test_regex_fallback_preserves_result_order(search_service):
         "pdf",
         "epub",
     ]
+
+
+@pytest.mark.parametrize("html", [
+    '<html><title>DDoS-Guard</title><body>Checking your browser</body></html>',
+    '<html><title>Maintenance</title><body>Please try later</body></html>',
+])
+def test_invalid_search_page_is_an_error(monkeypatch, search_service, html):
+    response = requests.Response()
+    response.status_code = 200
+    response._content = html.encode()
+    monkeypatch.setattr(search_service, "_alive_mirrors", ["https://anna-search.invalid"])
+    monkeypatch.setattr(search_service._session, "get", lambda *a, **kw: response)
+    monkeypatch.setattr(search_service, "_trigger_refresh_async", lambda: None)
+
+    result = search_service.search_books(query="Python")
+
+    assert result["results"] == []
+    assert "error" in result
+
+
+def test_invalid_page_tries_next_mirror(monkeypatch, search_service):
+    md5 = "7" * 32
+    pages = iter([
+        '<html><title>DDoS-Guard</title></html>',
+        _search_html(_card(md5, "English [en] · EPUB · 1MB")),
+    ])
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = next(pages).encode()
+        response.encoding = "utf-8"
+        return response
+
+    monkeypatch.setattr(search_service, "_alive_mirrors", [
+        "https://first.invalid", "https://second.invalid",
+    ])
+    monkeypatch.setattr(search_service._session, "get", get)
+    monkeypatch.setattr(search_service, "_trigger_refresh_async", lambda: None)
+
+    result = search_service.search_books(query="Python")
+
+    assert [item["md5"] for item in result["results"]] == [md5]
+    assert calls == ["https://first.invalid/search", "https://second.invalid/search"]
+
+
+@pytest.mark.parametrize("html, expected_status", [
+    ('<html><title>DDoS-Guard</title></html>', 502),
+    (_search_html(), 200),
+])
+def test_search_api_distinguishes_blocked_and_empty(
+    monkeypatch, search_service, html, expected_status,
+):
+    from flask import Flask
+    from api.search import search_bp
+
+    response = requests.Response()
+    response.status_code = 200
+    response._content = html.encode()
+    monkeypatch.setattr(search_service, "_alive_mirrors", ["https://anna-search.invalid"])
+    monkeypatch.setattr(search_service._session, "get", lambda *a, **kw: response)
+    monkeypatch.setattr(search_service, "_trigger_refresh_async", lambda: None)
+    app = Flask(__name__)
+    app.register_blueprint(search_bp)
+
+    result = app.test_client().get("/api/search?q=Python")
+
+    assert result.status_code == expected_status
+    assert result.json["code"] == (502 if expected_status == 502 else 0)
+    assert result.json["data"] == {"total": 0, "results": []}
+
+
+def test_all_blocked_mirrors_recover_browser_session(monkeypatch, search_service):
+    candidate = "https://candidate.invalid"
+    base = "https://configured.invalid"
+    monkeypatch.setattr(config, "AA_CANDIDATE_URLS", [candidate])
+    monkeypatch.setattr(config, "AA_BASE_URL", base)
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", True)
+    probe = Mock(side_effect=[(candidate, None), (base, 100)])
+    refresh = Mock()
+    monkeypatch.setattr(search_service, "_probe_mirror", probe)
+    monkeypatch.setattr(search_service, "_refresh_browser_session", refresh)
+
+    assert search_service._probe_all_mirrors() == [base]
+
+    refresh.assert_called_once_with(base)
+    assert probe.call_args_list == [
+        call(candidate, config.AA_PROBE_TIMEOUT),
+        call(base, config.AA_REQUEST_TIMEOUT),
+    ]
+
+
+def test_working_http_mirror_does_not_launch_browser(monkeypatch, search_service):
+    candidate = "https://candidate.invalid"
+    monkeypatch.setattr(config, "AA_CANDIDATE_URLS", [candidate])
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", True)
+    monkeypatch.setattr(search_service, "_probe_mirror", lambda *a: (candidate, 100))
+    refresh = Mock()
+    monkeypatch.setattr(search_service, "_refresh_browser_session", refresh)
+
+    assert search_service._probe_all_mirrors() == [candidate]
+
+    refresh.assert_not_called()
+
+
+def test_browser_failure_keeps_service_available(monkeypatch, search_service):
+    base = "https://configured.invalid"
+    monkeypatch.setattr(config, "AA_CANDIDATE_URLS", [base])
+    monkeypatch.setattr(config, "AA_BASE_URL", base)
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", True)
+    monkeypatch.setattr(search_service, "_probe_mirror", lambda *a: (base, None))
+    refresh = Mock(side_effect=TimeoutError("verification unavailable"))
+    monkeypatch.setattr(search_service, "_refresh_browser_session", refresh)
+
+    assert search_service._probe_all_mirrors() == [base]
+
+    refresh.assert_called_once_with(base)

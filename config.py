@@ -112,6 +112,10 @@ AA_FALLBACK_TIMEOUT = int(os.getenv("AA_FALLBACK_TIMEOUT", 6))
 # 连续失败多少次触发后台重新探测（重排镜像优先级）
 AA_REFRESH_AFTER_FAILS = int(os.getenv("AA_REFRESH_AFTER_FAILS", 3))
 
+# Docker enables browser verification with Chromium running under Xvfb.
+AA_BROWSER_ENABLED = os.getenv("AA_BROWSER_ENABLED", "false").lower() == "true"
+AA_BROWSER_TIMEOUT = int(os.getenv("AA_BROWSER_TIMEOUT", 45))
+
 # 文件目录
 # UPLOAD_DIR:  /api/parse/upload 的临时文件,解析完立即删除
 # BOOK_STORAGE_DIR: 通过 md5 下载的原书缓存,按 BOOK_CACHE_TTL_SEC 过期清理

@@ -58,6 +58,16 @@ docker compose up -d
 
 首次启动会构建镜像（约 1-2 分钟）。
 
+搜索镜像均被浏览器验证拦截时，Docker 镜像会通过 Chromium + Xvfb 完成
+JavaScript 验证，再把同一会话交给普通 HTTP 搜索。验证发生在启动探测或连续
+搜索失败后的后台重探中；Cookie 仅存在进程内存，不写入日志或 Redis。
+冷启动验证可能需要数十秒，必须以实际 `/api/search` 返回书籍列表判断搜索恢复，
+不能只看 `/health`。若上游要求人工验证码，服务会明确返回搜索失败，不伪装成空结果。
+
+Docker 默认启用 `AA_BROWSER_ENABLED=true`，单次浏览器验证超时由
+`AA_BROWSER_TIMEOUT` 控制（默认 45 秒）。本地 Python 运行默认不启用浏览器；
+Linux 手工启用时需安装 Playwright Chromium，并通过 `xvfb-run` 启动服务。
+
 ### 3. 验证
 
 ```bash
