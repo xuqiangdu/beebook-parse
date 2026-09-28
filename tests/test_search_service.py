@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from unittest.mock import Mock, call
 
 import pytest
 import requests
@@ -25,6 +26,9 @@ def search_service():
         "AA_BASE_URL",
         "https://anna-search.invalid",
     )
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", False)
+    monkeypatch.setattr(config, "AA_SECRET_KEY", "")
+    monkeypatch.setattr(config, "AA_SECRET_KEYS", "")
     monkeypatch.setattr(
         requests.Session,
         "get",
@@ -33,6 +37,12 @@ def search_service():
     module = importlib.import_module("services.search_service")
     monkeypatch.undo()
     return module
+
+
+@pytest.fixture(autouse=True)
+def no_member_credentials(monkeypatch):
+    monkeypatch.setattr(config, "AA_SECRET_KEY", "")
+    monkeypatch.setattr(config, "AA_SECRET_KEYS", "")
 
 
 def _search_html(*cards: str) -> str:
@@ -201,3 +211,233 @@ def test_regex_fallback_preserves_result_order(search_service):
         "pdf",
         "epub",
     ]
+
+
+@pytest.mark.parametrize("html", [
+    '<html><title>DDoS-Guard</title><body>Checking your browser</body></html>',
+    '<html><title>Maintenance</title><body>Please try later</body></html>',
+])
+def test_invalid_search_page_is_an_error(monkeypatch, search_service, html):
+    response = requests.Response()
+    response.status_code = 200
+    response._content = html.encode()
+    monkeypatch.setattr(search_service, "_alive_mirrors", ["https://anna-search.invalid"])
+    monkeypatch.setattr(search_service._session, "get", lambda *a, **kw: response)
+    monkeypatch.setattr(search_service, "_trigger_refresh_async", lambda: None)
+
+    result = search_service.search_books(query="Python")
+
+    assert result["results"] == []
+    assert "error" in result
+
+
+def test_invalid_page_tries_next_mirror(monkeypatch, search_service):
+    md5 = "7" * 32
+    pages = iter([
+        '<html><title>DDoS-Guard</title></html>',
+        _search_html(_card(md5, "English [en] · EPUB · 1MB")),
+    ])
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = next(pages).encode()
+        response.encoding = "utf-8"
+        return response
+
+    monkeypatch.setattr(search_service, "_alive_mirrors", [
+        "https://first.invalid", "https://second.invalid",
+    ])
+    monkeypatch.setattr(search_service._session, "get", get)
+    monkeypatch.setattr(search_service, "_trigger_refresh_async", lambda: None)
+
+    result = search_service.search_books(query="Python")
+
+    assert [item["md5"] for item in result["results"]] == [md5]
+    assert calls == ["https://first.invalid/search", "https://second.invalid/search"]
+
+
+@pytest.mark.parametrize("html, expected_status", [
+    ('<html><title>DDoS-Guard</title></html>', 502),
+    (_search_html(), 200),
+])
+def test_search_api_distinguishes_blocked_and_empty(
+    monkeypatch, search_service, html, expected_status,
+):
+    from flask import Flask
+    from api.search import search_bp
+
+    response = requests.Response()
+    response.status_code = 200
+    response._content = html.encode()
+    monkeypatch.setattr(search_service, "_alive_mirrors", ["https://anna-search.invalid"])
+    monkeypatch.setattr(search_service._session, "get", lambda *a, **kw: response)
+    monkeypatch.setattr(search_service, "_trigger_refresh_async", lambda: None)
+    app = Flask(__name__)
+    app.register_blueprint(search_bp)
+
+    result = app.test_client().get("/api/search?q=Python")
+
+    assert result.status_code == expected_status
+    assert result.json["code"] == (502 if expected_status == 502 else 0)
+    assert result.json["data"] == {"total": 0, "results": []}
+
+
+def test_all_blocked_mirrors_recover_browser_session(monkeypatch, search_service):
+    candidate = "https://candidate.invalid"
+    base = "https://configured.invalid"
+    monkeypatch.setattr(config, "AA_CANDIDATE_URLS", [candidate])
+    monkeypatch.setattr(config, "AA_BASE_URL", base)
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", True)
+    probe = Mock(side_effect=[(candidate, None), (base, 100)])
+    refresh = Mock()
+    monkeypatch.setattr(search_service, "_probe_mirror", probe)
+    monkeypatch.setattr(search_service, "_refresh_browser_session", refresh)
+
+    assert search_service._probe_all_mirrors() == [base]
+
+    refresh.assert_called_once_with(base)
+    assert probe.call_args_list == [
+        call(candidate, config.AA_PROBE_TIMEOUT),
+        call(base, config.AA_REQUEST_TIMEOUT),
+    ]
+
+
+def test_working_http_mirror_does_not_launch_browser(monkeypatch, search_service):
+    candidate = "https://candidate.invalid"
+    monkeypatch.setattr(config, "AA_CANDIDATE_URLS", [candidate])
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", True)
+    monkeypatch.setattr(search_service, "_probe_mirror", lambda *a: (candidate, 100))
+    refresh = Mock()
+    monkeypatch.setattr(search_service, "_refresh_browser_session", refresh)
+
+    assert search_service._probe_all_mirrors() == [candidate]
+
+    refresh.assert_not_called()
+
+
+def test_browser_failure_keeps_service_available(monkeypatch, search_service):
+    base = "https://configured.invalid"
+    monkeypatch.setattr(config, "AA_CANDIDATE_URLS", [base])
+    monkeypatch.setattr(config, "AA_BASE_URL", base)
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", True)
+    monkeypatch.setattr(search_service, "_probe_mirror", lambda *a: (base, None))
+    refresh = Mock(side_effect=TimeoutError("verification unavailable"))
+    monkeypatch.setattr(search_service, "_refresh_browser_session", refresh)
+
+    assert search_service._probe_all_mirrors() == [base]
+
+    refresh.assert_called_once_with(base)
+
+
+def test_member_recovery_precedes_browser(monkeypatch, search_service):
+    base = "https://configured.invalid"
+    monkeypatch.setattr(config, "AA_CANDIDATE_URLS", [base])
+    monkeypatch.setattr(config, "AA_BASE_URL", base)
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", True)
+    monkeypatch.setattr(search_service, "_probe_mirror", lambda *a: (base, None))
+    member = Mock(return_value=100)
+    browser = Mock()
+    monkeypatch.setattr(search_service, "_refresh_member_session", member)
+    monkeypatch.setattr(search_service, "_refresh_browser_session", browser)
+
+    assert search_service._probe_all_mirrors() == [base]
+    member.assert_called_once_with(base)
+    browser.assert_not_called()
+
+
+def test_failed_member_recovery_uses_browser(monkeypatch, search_service):
+    base = "https://configured.invalid"
+    monkeypatch.setattr(config, "AA_CANDIDATE_URLS", [base])
+    monkeypatch.setattr(config, "AA_BASE_URL", base)
+    monkeypatch.setattr(config, "AA_BROWSER_ENABLED", True)
+    probe = Mock(side_effect=[(base, None), (base, 100)])
+    member = Mock(return_value=None)
+    browser = Mock()
+    monkeypatch.setattr(search_service, "_probe_mirror", probe)
+    monkeypatch.setattr(search_service, "_refresh_member_session", member)
+    monkeypatch.setattr(search_service, "_refresh_browser_session", browser)
+
+    assert search_service._probe_all_mirrors() == [base]
+    member.assert_called_once_with(base)
+    browser.assert_called_once_with(base)
+
+
+@pytest.mark.parametrize("search_status, html, recovered", [
+    (403, "Blocked", False),
+    (200, "<title>DDoS-Guard</title>", False),
+    (200, _search_html(_card("8" * 32, "EPUB · 1MB")), True),
+])
+def test_member_cookie_requires_valid_search(
+    monkeypatch, search_service, search_status, html, recovered,
+):
+    monkeypatch.setattr(config, "AA_SECRET_KEY", "test-member")
+    shared = requests.Session()
+    shared.headers["User-Agent"] = "verified-agent"
+    shared.cookies.set("existing", "keep", domain="configured.invalid")
+    monkeypatch.setattr(search_service, "_session", shared)
+
+    def login(session, url, **kwargs):
+        assert url == "https://configured.invalid/account/"
+        assert kwargs["data"] == {"key": "test-member"}
+        assert session is not shared
+        session.cookies.set("member", "test-cookie", domain="configured.invalid")
+        response = requests.Response()
+        response.status_code = 200
+        return response
+
+    def search(session, url, **kwargs):
+        assert session.headers["User-Agent"] == shared.headers["User-Agent"]
+        assert session.cookies.get("member") == "test-cookie"
+        response = requests.Response()
+        response.status_code = search_status
+        response._content = html.encode()
+        return response
+
+    monkeypatch.setattr(requests.Session, "post", login)
+    monkeypatch.setattr(requests.Session, "get", search)
+
+    latency = search_service._refresh_member_session("https://configured.invalid")
+
+    assert (latency is not None) == recovered
+    assert shared.cookies.get("existing") == "keep"
+    assert shared.cookies.get("member") == ("test-cookie" if recovered else None)
+
+
+def test_member_recovery_deduplicates_and_tries_next_key(
+    monkeypatch, search_service, caplog,
+):
+    monkeypatch.setattr(config, "AA_SECRET_KEY", "first-test-key")
+    monkeypatch.setattr(config, "AA_SECRET_KEYS", "first-test-key, second-test-key, ")
+    shared = requests.Session()
+    monkeypatch.setattr(search_service, "_session", shared)
+    seen = []
+
+    def login(session, url, **kwargs):
+        key = kwargs["data"]["key"]
+        seen.append(key)
+        if key == "first-test-key":
+            raise requests.HTTPError("login rejected first-test-key")
+        session.cookies.set("member", "second-cookie", domain="configured.invalid")
+        response = requests.Response()
+        response.status_code = 200
+        return response
+
+    monkeypatch.setattr(requests.Session, "post", login)
+    monkeypatch.setattr(search_service, "_probe_mirror", lambda *a: (a[0], 100))
+
+    assert search_service._refresh_member_session("https://configured.invalid") == 100
+    assert seen == ["first-test-key", "second-test-key"]
+    assert shared.cookies.get("member") == "second-cookie"
+    assert "first-test-key" not in caplog.text
+    assert "second-test-key" not in caplog.text
+
+
+def test_no_member_key_skips_login(monkeypatch, search_service):
+    login = Mock()
+    monkeypatch.setattr(requests.Session, "post", login)
+
+    assert search_service._refresh_member_session("https://configured.invalid") is None
+    login.assert_not_called()

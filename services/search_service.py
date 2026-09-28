@@ -42,7 +42,7 @@ _SEARCH_EXTENSIONS = frozenset({
 })
 
 
-def _probe_mirror(base: str, timeout: int) -> tuple[str, float | None]:
+def _probe_mirror(base: str, timeout: int, session=None) -> tuple[str, float | None]:
     """
     探测单个镜像。通过两个判据才算"真可用"：
       1. HTTP 200
@@ -52,15 +52,80 @@ def _probe_mirror(base: str, timeout: int) -> tuple[str, float | None]:
     """
     try:
         t0 = time.time()
-        r = _session.get(f"{base}/search",
+        r = (session or _session).get(f"{base}/search",
                          params={"q": "中国"},  # 用常见中文词，保证能命中内容
                          timeout=timeout)
         dt = (time.time() - t0) * 1000
         if r.status_code == 200 and "js-aarecord-list-outer" in r.text:
             return base, dt
     except Exception as e:
-        logger.debug(f"镜像探测失败 {base}: {e}")
+        logger.debug("镜像探测失败 %s: %s", base, type(e).__name__)
     return base, None
+
+
+def _refresh_member_session(base: str) -> float | None:
+    """Validate configured members without changing download pool state."""
+    keys = dict.fromkeys(
+        key.strip() for key in [config.AA_SECRET_KEY, *config.AA_SECRET_KEYS.split(",")]
+        if key.strip()
+    )
+    for key in keys:
+        try:
+            with requests.Session() as session:
+                session.headers.update(_session.headers)
+                response = session.post(
+                    f"{base}/account/", data={"key": key},
+                    timeout=config.AA_REQUEST_TIMEOUT,
+                )
+                response.raise_for_status()
+                _, latency = _probe_mirror(base, config.AA_REQUEST_TIMEOUT, session)
+                if latency is not None:
+                    # A login response alone does not prove active membership.
+                    _session.cookies.update(session.cookies)
+                    return latency
+        except Exception as e:
+            logger.warning("会员搜索会话验证失败: %s", type(e).__name__)
+    return None
+
+
+def _refresh_browser_session(base: str):
+    """Complete browser verification and keep the session only in memory."""
+    from playwright.sync_api import sync_playwright
+
+    deadline = time.monotonic() + config.AA_BROWSER_TIMEOUT
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+            timeout=max(1, int((deadline - time.monotonic()) * 1000)),
+        )
+        try:
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(
+                f"{base}/search?q=Python",
+                wait_until="domcontentloaded",
+                timeout=max(1, int((deadline - time.monotonic()) * 1000)),
+            )
+            page.locator(".js-aarecord-list-outer").wait_for(
+                state="attached",
+                timeout=max(1, int((deadline - time.monotonic()) * 1000)),
+            )
+            user_agent = page.evaluate("navigator.userAgent")
+            cookies = context.cookies([base])
+        finally:
+            browser.close()
+
+    # Match the verified browser; never log or persist verification cookies.
+    _session.headers["User-Agent"] = user_agent
+    for cookie in cookies:
+        expires = cookie.get("expires", -1)
+        _session.cookies.set(
+            cookie["name"], cookie["value"],
+            domain=cookie["domain"], path=cookie["path"],
+            secure=cookie.get("secure", False),
+            expires=int(expires) if expires > 0 else None,
+        )
 
 
 def _probe_all_mirrors() -> list[str]:
@@ -82,6 +147,23 @@ def _probe_all_mirrors() -> list[str]:
                 logger.info(f"  ✓ {base:<40} {latency:.0f}ms")
             else:
                 logger.info(f"  ✗ {base:<40} 不可用")
+
+    if not alive:
+        latency = _refresh_member_session(config.AA_BASE_URL)
+        if latency is not None:
+            alive.append((config.AA_BASE_URL, latency))
+            logger.info("会员会话验证成功，HTTP 搜索已恢复")
+
+    if not alive and config.AA_BROWSER_ENABLED:
+        try:
+            logger.info("HTTP 镜像均不可用，开始后台浏览器验证")
+            _refresh_browser_session(config.AA_BASE_URL)
+            base, latency = _probe_mirror(config.AA_BASE_URL, config.AA_REQUEST_TIMEOUT)
+            if latency is not None:
+                alive.append((base, latency))
+                logger.info("浏览器会话验证成功，HTTP 搜索已恢复")
+        except Exception as e:
+            logger.warning("浏览器验证未完成: %s", type(e).__name__)
 
     if not alive:
         logger.warning(f"所有镜像都不可用，回退到 {config.AA_BASE_URL}")
@@ -206,7 +288,7 @@ def search_books(
     if not mirrors:
         mirrors = [config.AA_BASE_URL]
 
-    html = None
+    result = None
     used_mirror = None
     last_err = None
     primary = mirrors[0]
@@ -216,7 +298,8 @@ def search_books(
         try:
             resp = _session.get(f"{mirror}/search", params=params, timeout=timeout)
             resp.raise_for_status()
-            html = resp.text
+            # Validate the exact result container before accepting a mirror.
+            result = _parse_with_bs4(resp.text)
             used_mirror = mirror
             break
         except Exception as e:
@@ -224,7 +307,7 @@ def search_books(
             logger.warning(f"镜像请求失败 [{mirror}] timeout={timeout}s: {e}")
             continue
 
-    if html is None:
+    if result is None:
         # 全挂了：记失败 + 触发后台重探
         if _record_failure():
             logger.error(f"连续 {config.AA_REFRESH_AFTER_FAILS} 次失败，触发镜像重探")
@@ -240,19 +323,6 @@ def search_books(
 
     fallback_language = _single_requested_language(lang)
     fallback_extension = _single_requested_extension(ext)
-
-    # Only the BS4 parser is allowed here because it is scoped to Anna's exact
-    # result container. A page-wide regex fallback would include hidden partial
-    # matches and return unrelated books.
-    try:
-        result = _parse_with_bs4(html)
-    except Exception as e:
-        logger.error(f"BS4 精确结果解析异常: {e}")
-        return {
-            "total": 0,
-            "results": [],
-            "error": f"搜索页精确结果解析失败: {e}",
-        }
 
     # Anna renders partial matches outside .js-aarecord-list-outer. An empty
     # exact container is a valid empty search result, not a parser failure.
@@ -277,7 +347,9 @@ def _parse_with_bs4(html: str) -> dict:
 
     # 搜索结果卡片（每个卡片是 js-aarecord-list-outer 的直接子 div）
     outer = soup.select_one(".js-aarecord-list-outer")
-    cards = outer.find_all("div", recursive=False) if outer else []
+    if outer is None:
+        raise ValueError("上游未返回有效搜索页，可能处于浏览器验证或维护状态")
+    cards = outer.find_all("div", recursive=False)
 
     results = []
     for card in cards:

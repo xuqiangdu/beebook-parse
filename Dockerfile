@@ -7,11 +7,20 @@ WORKDIR /app
 #   libmagic1     —— python-magic 的依赖（/api/parse 做 MIME 检测时用）
 RUN apt-get -o Acquire::Retries=5 update \
     && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-        poppler-utils libmagic1 \
+        poppler-utils libmagic1 xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+RUN playwright install --with-deps chromium
+
+# Xvfb readiness signaling requires its parent to run outside PID 1.
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+ENV AA_BROWSER_ENABLED=true
 
 COPY . .
 
@@ -25,6 +34,6 @@ EXPOSE 5555
 #   --threads 8     HTTP 处理线程数(只接请求,不做解析)
 #   --timeout 0     关掉 gunicorn 自身超时,交给 watchdog 管
 #   --access-logfile -    访问日志输出到 stdout(docker logs 可见)
-CMD ["gunicorn", "-w", "1", "-k", "gthread", "--threads", "8", \
+CMD ["xvfb-run", "-a", "gunicorn", "-w", "1", "-k", "gthread", "--threads", "8", \
      "--timeout", "0", "--access-logfile", "-", \
      "-b", "0.0.0.0:5555", "app:app"]
