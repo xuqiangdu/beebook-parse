@@ -16,17 +16,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 import config
+from services.aa_session import session as _session, new_browser_context, remember_browser_session
 
 logger = logging.getLogger(__name__)
-
-# 模块级 Session：复用 TLS 连接和 HTTP keep-alive，省去每次握手（~500ms-1s）
-# 同时声明 Accept-Encoding，让上游返回 gzip 压缩的 HTML（560KB → ~80KB）
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-})
 
 # ---- 活跃镜像状态（全模块共享）----
 # _alive_mirrors: 按 latency 排序的活跃镜像列表，第一个即"主镜像"
@@ -100,7 +92,7 @@ def _refresh_browser_session(base: str):
             timeout=max(1, int((deadline - time.monotonic()) * 1000)),
         )
         try:
-            context = browser.new_context()
+            context = new_browser_context(browser, base, http_session=_session)
             page = context.new_page()
             page.goto(
                 f"{base}/search?q=Python",
@@ -112,20 +104,9 @@ def _refresh_browser_session(base: str):
                 timeout=max(1, int((deadline - time.monotonic()) * 1000)),
             )
             user_agent = page.evaluate("navigator.userAgent")
-            cookies = context.cookies([base])
+            remember_browser_session(context, base, user_agent, http_session=_session)
         finally:
             browser.close()
-
-    # Match the verified browser; never log or persist verification cookies.
-    _session.headers["User-Agent"] = user_agent
-    for cookie in cookies:
-        expires = cookie.get("expires", -1)
-        _session.cookies.set(
-            cookie["name"], cookie["value"],
-            domain=cookie["domain"], path=cookie["path"],
-            secure=cookie.get("secure", False),
-            expires=int(expires) if expires > 0 else None,
-        )
 
 
 def _probe_all_mirrors() -> list[str]:

@@ -35,6 +35,7 @@ from flask import Flask
 from api.aa_keys import aa_keys_bp
 from api.parse import parse_bp
 from api.search import search_bp
+from api.cover import cover_bp
 from api.common import api_ok
 from services.aa_key_pool import pool_health, seed_keys_from_env
 from services.task_manager import reconcile_on_startup, start_watchdog
@@ -46,6 +47,7 @@ app.json.ensure_ascii = False
 app.register_blueprint(aa_keys_bp)
 app.register_blueprint(parse_bp)
 app.register_blueprint(search_bp)
+app.register_blueprint(cover_bp)
 
 
 # ⭐v2 启动自愈 + 看门狗
